@@ -16,29 +16,17 @@
 
 package xiangshan.cache
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import utils.XSDebug
-
-class AtomicsResp(implicit p: Parameters) extends DCacheBundle {
-  val data    = UInt(DataBits.W)
-  val miss    = Bool()
-  val miss_id = UInt(log2Up(cfg.nMissEntries).W)
-  val replay  = Bool()
-  val error   = Bool()
-
-  val ack_miss_queue = Bool()
-
-  val id     = UInt(reqIdWidth.W)
-}
+import utility.XSDebug
 
 class AtomicsReplayEntry(implicit p: Parameters) extends DCacheModule
 {
   val io = IO(new Bundle {
-    val lsu  = Flipped(new DCacheWordIOWithVaddr)
+    val lsu  = Flipped(new AtomicWordIO)
     val pipe_req  = Decoupled(new MainPipeReq)
-    val pipe_resp = Flipped(ValidIO(new AtomicsResp))
+    val pipe_resp = Flipped(ValidIO(new MainPipeResp))
     val block_lr = Input(Bool())
 
     val block_addr  = Output(Valid(UInt()))
@@ -61,14 +49,12 @@ class AtomicsReplayEntry(implicit p: Parameters) extends DCacheModule
   io.block_addr.bits  := req.addr
 
 
-  when (state =/= s_invalid) {
-    XSDebug("AtomicsReplayEntry: state: %d block_addr: %x\n", state, io.block_addr.bits)
-  }
+  XSDebug(state =/= s_invalid, "AtomicsReplayEntry: state: %d block_addr: %x\n", state, io.block_addr.bits)
 
   // --------------------------------------------
   // s_invalid: receive requests
   when (state === s_invalid) {
-    when (io.lsu.req.fire()) {
+    when (io.lsu.req.fire) {
       req   := io.lsu.req.bits
       state := s_pipe_req
     }
@@ -96,7 +82,7 @@ class AtomicsReplayEntry(implicit p: Parameters) extends DCacheModule
     pipe_req.amo_data  := req.data
     pipe_req.amo_mask  := req.mask
 
-    when (io.pipe_req.fire()) {
+    when (io.pipe_req.fire) {
       state := s_pipe_resp
       assert(!io.pipe_req.bits.vaddr === 0.U)
     }
@@ -115,7 +101,7 @@ class AtomicsReplayEntry(implicit p: Parameters) extends DCacheModule
     // TODO: add assertions:
     // 1. add a replay delay counter?
     // 2. when req gets into MissQueue, it should not miss any more
-    when (io.pipe_resp.fire()) {
+    when (io.pipe_resp.fire) {
       when (io.pipe_resp.bits.miss) {
         when (io.pipe_resp.bits.replay) {
           state := s_pipe_req
@@ -137,25 +123,25 @@ class AtomicsReplayEntry(implicit p: Parameters) extends DCacheModule
     io.lsu.resp.bits.id    := resp_id
     io.lsu.resp.bits.error := resp_error
 
-    when (io.lsu.resp.fire()) {
+    when (io.lsu.resp.fire) {
       state := s_invalid
     }
   }
 
   // debug output
-  when (io.lsu.req.fire()) {
-    io.lsu.req.bits.dump()
-  }
+  // when (io.lsu.req.fire) {
+  //   io.lsu.req.bits.dump()
+  // }
 
-  when (io.lsu.resp.fire()) {
-    io.lsu.resp.bits.dump()
-  }
+  // when (io.lsu.resp.fire) {
+  //   io.lsu.resp.bits.dump()
+  // }
 
-//  when (io.pipe_req.fire()) {
+//  when (io.pipe_req.fire) {
 //    io.pipe_req.bits.dump()
 //  }
 //
-//  when (io.pipe_resp.fire()) {
+//  when (io.pipe_resp.fire) {
 //    io.pipe_resp.bits.dump()
 //  }
 }

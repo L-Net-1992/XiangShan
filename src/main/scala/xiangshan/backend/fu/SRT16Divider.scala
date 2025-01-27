@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -12,6 +13,13 @@
 * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 *
 * See the Mulan PSL v2 for more details.
+*
+*
+* Acknowledgement
+*
+* This implementation is inspired by several key papers:
+* [1] Elisardo Antelo, Tomas Lang, Paolo Montuschi, and Alberto Nannarelli. "[Digit-recurrence dividers with reduced
+* logical depth.](https://doi.org/10.1109/TC.2005.115)" IEEE Transactions on Computers 54.7: 837-851. 2005.
 ***************************************************************************************/
 
 // This file contains components originally written by Yifei He, see
@@ -20,10 +28,12 @@
 
 package xiangshan.backend.fu
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import utils.SignExt
+import utils._
+import utility._
+import xiangshan._
 import xiangshan.backend.fu.util.CSA3_2
 
 class SRT16DividerDataModule(len: Int) extends Module {
@@ -32,6 +42,7 @@ class SRT16DividerDataModule(len: Int) extends Module {
     val valid, sign, kill_w, kill_r, isHi, isW = Input(Bool())
     val in_ready = Output(Bool())
     val out_valid = Output(Bool())
+    val out_validNext = Output(Bool())
     val out_data = Output(UInt(len.W))
     val out_ready = Input(Bool())
   })
@@ -49,7 +60,7 @@ class SRT16DividerDataModule(len: Int) extends Module {
   val quot_neg_2 :: quot_neg_1 :: quot_0 :: quot_pos_1 :: quot_pos_2 :: Nil = Enum(5)
 
 
-  val state = RegInit(UIntToOH(s_idle, 7))
+  val state = RegInit((1 << s_idle.litValue.toInt).U(7.W))
 
   // reused wires
 //  val aNormAbs = Wire(UInt((len + 1).W)) // Inputs of xNormAbs regs below
@@ -88,15 +99,15 @@ class SRT16DividerDataModule(len: Int) extends Module {
     state := Mux(finalIter, UIntToOH(s_post_0, 7), UIntToOH(s_iter, 7))
   } .elsewhen(state(s_post_0)) { // if rem < 0, rem = rem + d
     state := UIntToOH(s_post_1, 7)
-  } .elsewhen(state(s_post_1) && out_fire) {
+  } .elsewhen(state(s_post_1)) {
     state := UIntToOH(s_finish, 7)
-  } .elsewhen(state(s_finish)) {
+  } .elsewhen(state(s_finish) && io.out_ready) {
     state := UIntToOH(s_idle, 7)
   } .otherwise {
     state := state
   }
 
-  io.in_ready := state(s_idle)
+  // io.in_ready := state(s_idle)
   aInverter := -Mux(state(s_idle), a, quotIterReg) // 64, 0
   dInverter := -Mux(state(s_idle), d, quotM1IterReg) // 64, 0
 
@@ -129,8 +140,8 @@ class SRT16DividerDataModule(len: Int) extends Module {
   // Second cycle, state is pre_0
   // calculate lzc and move div* and lzc diff check if no_iter_needed
 
-  aLZC := PriorityEncoder(aAbsReg(len - 1, 0).asBools().reverse)
-  dLZC := PriorityEncoder(dAbsReg(len - 1, 0).asBools().reverse)
+  aLZC := PriorityEncoder(aAbsReg(len - 1, 0).asBools.reverse)
+  dLZC := PriorityEncoder(dAbsReg(len - 1, 0).asBools.reverse)
   val aLZCReg = RegEnable(aLZC, state(s_pre_0)) // 7, 0
   val dLZCReg = RegEnable(dLZC, state(s_pre_0))
 
@@ -141,8 +152,8 @@ class SRT16DividerDataModule(len: Int) extends Module {
   // special case:
   // divisor is 1 or -1; dividend has less bits than divisor; divisor is zero
   // s_pre_0:
-  val dIsOne = dLZC(lzc_width - 1, 0).andR()
-  val dIsZero = ~dNormReg.orR()
+  val dIsOne = dLZC(lzc_width - 1, 0).andR
+  val dIsZero = ~dNormReg.orR
   val aIsZero = RegEnable(aLZC(lzc_width), state(s_pre_0))
   val aTooSmall = RegEnable(aLZC(lzc_width) | lzcWireDiff(lzc_width), state(s_pre_0))
   special := dIsOne | dIsZero | aTooSmall
@@ -172,8 +183,8 @@ class SRT16DividerDataModule(len: Int) extends Module {
   val rCarryInit = 0.U(itn_len.W)
 
   val rSumInitTrunc = Cat(0.U(1.W), rSumInit(itn_len - 4, itn_len - 4 - 4 + 1)) // 0.00___
-  val mInitPos1 = MuxLookup(dNormReg(len-2, len-4), "b00100".U(5.W),
-    Array(
+  val mInitPos1 = MuxLookup(dNormReg(len-2, len-4), "b00100".U(5.W))(
+    Seq(
       0.U -> "b00100".U(5.W),
       1.U -> "b00100".U(5.W),
       2.U -> "b00100".U(5.W),
@@ -184,8 +195,8 @@ class SRT16DividerDataModule(len: Int) extends Module {
       7.U -> "b01000".U(5.W),
     )
   )
-  val mInitPos2 = MuxLookup(dNormReg(len-2, len-4), "b01100".U(5.W),
-    Array(
+  val mInitPos2 = MuxLookup(dNormReg(len-2, len-4), "b01100".U(5.W))(
+    Seq(
       0.U -> "b01100".U(5.W),
       1.U -> "b01110".U(5.W),
       2.U -> "b01111".U(5.W),
@@ -238,10 +249,10 @@ class SRT16DividerDataModule(len: Int) extends Module {
 
   // Give values to the regs and wires above...
   val dForLookup = dPos(len-2, len-4)
-  mNeg := VecInit(Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W), mLookUpTable2.minus_m(0)), 11), 0.U(1.W)), // (2, 5) -> (6, 6)
-                  Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W), mLookUpTable2.minus_m(1)), 10) ,0.U(2.W)), // (3, 4) -> (6, 6)
-                  Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W), mLookUpTable2.minus_m(2)), 10) ,0.U(2.W)),
-                  Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W), mLookUpTable2.minus_m(3)), 11) ,0.U(1.W))
+  mNeg := VecInit(Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W))(mLookUpTable2.minus_m(0)), 11), 0.U(1.W)), // (2, 5) -> (6, 6)
+                  Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W))(mLookUpTable2.minus_m(1)), 10) ,0.U(2.W)), // (3, 4) -> (6, 6)
+                  Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W))(mLookUpTable2.minus_m(2)), 10) ,0.U(2.W)),
+                  Cat(SignExt(MuxLookup(dNormReg(len-2, len-4), "b00000000".U(7.W))(mLookUpTable2.minus_m(3)), 11) ,0.U(1.W))
   )
   udNeg := VecInit( Cat(SignExt(dPos, 66), 0.U(2.W)),
                     Cat(SignExt(dPos, 67), 0.U(1.W)),
@@ -371,13 +382,13 @@ class SRT16DividerDataModule(len: Int) extends Module {
   // post_1
   val r = rNextReg
   val rPd = rNextPdReg
-  val rIsZero = ~(r.orR())
-  val needCorr = Mux(rSignReg, ~r(len) & r.orR(), r(len)) // when we get pos rem for a<0 or neg rem for a>0
+  val rIsZero = ~(r.orR)
+  val needCorr = Mux(rSignReg, ~r(len) & r.orR, r(len)) // when we get pos rem for a<0 or neg rem for a>0
   val rPreShifted = Mux(needCorr, rPd, r)
   val rightShifter = Module(new RightShifter(len, lzc_width))
   rightShifter.io.in := rPreShifted
   rightShifter.io.shiftNum := dLZCReg
-  rightShifter.io.msb := Mux(~(rPreShifted.orR()), 0.U, rSignReg)
+  rightShifter.io.msb := Mux(~(rPreShifted.orR), 0.U, rSignReg)
   val rShifted = rightShifter.io.out
   val rFinal = RegEnable(Mux(specialReg, remSpecialReg, rShifted), state(s_post_1))// right shifted remainder. shift by the number of bits divisor is shifted
   val qFinal = RegEnable(Mux(specialReg, quotSpecialReg, Mux(needCorr, quotM1IterReg, quotIterReg)), state(s_post_1))
@@ -387,15 +398,15 @@ class SRT16DividerDataModule(len: Int) extends Module {
     res
   )
   io.in_ready := state(s_idle)
-  io.out_valid := state(s_post_1)
-
+  io.out_valid := state(s_finish)
+  io.out_validNext := state(s_post_1)
 }
 
 object mLookUpTable2 {
   // Usage :
   // result := decoder(QMCMinimizer, index, mLookupTable.xxx)
   val minus_m = Seq(
-    Array( // -m[-1]
+    Seq( // -m[-1]
       0.U -> "b00_11010".U(7.W),
       1.U -> "b00_11110".U(7.W),
       2.U -> "b01_00000".U(7.W),
@@ -405,7 +416,7 @@ object mLookUpTable2 {
       6.U -> "b01_01100".U(7.W),
       7.U -> "b01_10000".U(7.W)
     ),
-    Array( // -m[0]
+    Seq( // -m[0]
       0.U -> "b000_0100".U(7.W),
       1.U -> "b000_0110".U(7.W),
       2.U -> "b000_0110".U(7.W),
@@ -415,7 +426,7 @@ object mLookUpTable2 {
       6.U -> "b000_1000".U(7.W),
       7.U -> "b000_1000".U(7.W)
     ),
-    Array( //-m[1]
+    Seq( //-m[1]
       0.U -> "b111_1101".U(7.W),
       1.U -> "b111_1100".U(7.W),
       2.U -> "b111_1100".U(7.W),
@@ -425,7 +436,7 @@ object mLookUpTable2 {
       6.U -> "b111_1010".U(7.W),
       7.U -> "b111_1010".U(7.W)
     ),
-    Array( //-m[2]
+    Seq( //-m[2]
       0.U -> "b11_01000".U(7.W),
       1.U -> "b11_00100".U(7.W),
       2.U -> "b11_00010".U(7.W),
@@ -435,33 +446,4 @@ object mLookUpTable2 {
       6.U -> "b10_10110".U(7.W),
       7.U -> "b10_10010".U(7.W)
     ))
-}
-
-class SRT16Divider(len: Int)(implicit p: Parameters) extends AbstractDivider(len) {
-
-  val newReq = io.in.fire()
-
-  val uop = io.in.bits.uop
-  val uopReg = RegEnable(uop, newReq)
-  val ctrlReg = RegEnable(ctrl, newReq)
-
-  val divDataModule = Module(new SRT16DividerDataModule(len))
-
-  val kill_w = uop.robIdx.needFlush(io.redirectIn)
-  val kill_r = !divDataModule.io.in_ready && uopReg.robIdx.needFlush(io.redirectIn)
-
-  divDataModule.io.src(0) := io.in.bits.src(0)
-  divDataModule.io.src(1) := io.in.bits.src(1)
-  divDataModule.io.valid := io.in.valid
-  divDataModule.io.sign := sign
-  divDataModule.io.kill_w := kill_w
-  divDataModule.io.kill_r := kill_r
-  divDataModule.io.isHi := ctrlReg.isHi
-  divDataModule.io.isW := ctrlReg.isW
-  divDataModule.io.out_ready := io.out.ready
-
-  io.in.ready := divDataModule.io.in_ready
-  io.out.valid := divDataModule.io.out_valid
-  io.out.bits.data := divDataModule.io.out_data
-  io.out.bits.uop := uopReg
 }

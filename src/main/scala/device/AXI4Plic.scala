@@ -18,10 +18,10 @@ package device
 
 import chisel3._
 import chisel3.util._
-import chipsalliance.rocketchip.config._
+import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
-import utils.MaskExpand
-import utils.{HasTLDump, XSDebug, RegMap}
+import utils.HasTLDump
+import utility.{RegMap, MaskExpand, XSDebug}
 
 /*  base + 0x000000: Reserved (interrupt source 0 does not exist)
     base + 0x000004: Interrupt source 1 priority
@@ -142,7 +142,7 @@ class AXI4Plic
     val claimCompletionMap = claimCompletion.zipWithIndex.map {
       case (r, hart) => {
         val addr = 0x200004 + hart * 0x1000
-        when(in.r.fire() && (getOffset(raddr) === addr.U)) {
+        when(in.r.fire && (getOffset(raddr) === addr.U)) {
           inHandle(r) := true.B
         }
         RegMap(addr, r, completionFn)
@@ -173,7 +173,7 @@ class AXI4Plic
 
     val rdata = Wire(UInt(32.W))
     RegMap.generate(mapping, getOffset(raddr), rdata,
-      getOffset(waddr), in.w.fire(), in.w.bits.data, MaskExpand(in.w.bits.strb >> waddr(2, 0)))
+      getOffset(waddr), in.w.fire, in.w.bits.data, MaskExpand(in.w.bits.strb >> waddr(2, 0)))
     // narrow read
     in.r.bits.data := Fill(2, rdata)
 

@@ -16,30 +16,89 @@
 
 package xiangshan.cache.mmu
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
-import chisel3.experimental.chiselName
 import chisel3.util._
 import utils._
+import utility._
+import freechips.rocketchip.formal.PropertyClass
+import xiangshan.backend.fu.util.HasCSRConst
 
-@chiselName
+import scala.math.min
+
+// For Direct-map TLBs, we do not use it now
+class BankedAsyncDataModuleTemplateWithDup[T <: Data](
+  gen: T,
+  numEntries: Int,
+  numRead: Int,
+  numDup: Int,
+  numBanks: Int
+) extends Module {
+  val io = IO(new Bundle {
+    val raddr = Vec(numRead, Input(UInt(log2Ceil(numEntries).W)))
+    val rdata = Vec(numRead, Vec(numDup, Output(gen)))
+    val wen   = Input(Bool())
+    val waddr = Input(UInt(log2Ceil(numEntries).W))
+    val wdata = Input(gen)
+  })
+  require(numBanks > 1)
+  require(numEntries > numBanks)
+
+  val numBankEntries = numEntries / numBanks
+  def bankOffset(address: UInt): UInt = {
+    address(log2Ceil(numBankEntries) - 1, 0)
+  }
+
+  def bankIndex(address: UInt): UInt = {
+    address(log2Ceil(numEntries) - 1, log2Ceil(numBankEntries))
+  }
+
+  val dataBanks = Seq.tabulate(numBanks)(i => {
+    val bankEntries = if (i < numBanks - 1) numBankEntries else (numEntries - (i * numBankEntries))
+    Mem(bankEntries, gen)
+  })
+
+  // async read, but regnext
+  for (i <- 0 until numRead) {
+    val data_read = Reg(Vec(numDup, Vec(numBanks, gen)))
+    val bank_index = Reg(Vec(numDup, UInt(numBanks.W)))
+    for (j <- 0 until numDup) {
+      bank_index(j) := UIntToOH(bankIndex(io.raddr(i)))
+      for (k <- 0 until numBanks) {
+        data_read(j)(k) := Mux(io.wen && (io.waddr === io.raddr(i)),
+          io.wdata, dataBanks(k)(bankOffset(io.raddr(i))))
+      }
+    }
+    // next cycle
+    for (j <- 0 until numDup) {
+      io.rdata(i)(j) := Mux1H(bank_index(j), data_read(j))
+    }
+  }
+
+  // write
+  for (i <- 0 until numBanks) {
+    when (io.wen && (bankIndex(io.waddr) === i.U)) {
+      dataBanks(i)(bankOffset(io.waddr)) := io.wdata
+    }
+  }
+}
+
 class TLBFA(
-  sameCycle: Boolean,
+  parentName: String,
   ports: Int,
+  nDups: Int,
   nSets: Int,
   nWays: Int,
-  sramSinglePort: Boolean,
   saveLevel: Boolean = false,
   normalPage: Boolean,
   superPage: Boolean
 )(implicit p: Parameters) extends TlbModule with HasPerfEvents {
-  require(!(sameCycle && saveLevel))
 
-  val io = IO(new TlbStorageIO(nSets, nWays, ports))
+  val io = IO(new TlbStorageIO(nSets, nWays, ports, nDups))
   io.r.req.map(_.ready := true.B)
 
   val v = RegInit(VecInit(Seq.fill(nWays)(false.B)))
-  val entries = Reg(Vec(nWays, new TlbEntry(normalPage, superPage)))
+  val entries = Reg(Vec(nWays, new TlbSectorEntry(normalPage, superPage)))
   val g = entries.map(_.perm.g)
 
   for (i <- 0 until ports) {
@@ -48,44 +107,76 @@ class TLBFA(
     val access = io.access(i)
 
     val vpn = req.bits.vpn
-    val vpn_reg = if (sameCycle) vpn else RegEnable(vpn, req.fire())
-    val vpn_gen_ppn = if(sameCycle || saveLevel) vpn else vpn_reg
-
-    val refill_mask = if (sameCycle) 0.U(nWays.W) else Mux(io.w.valid, UIntToOH(io.w.bits.wayIdx), 0.U(nWays.W))
-    val hitVec = VecInit((entries.zipWithIndex).zip(v zip refill_mask.asBools).map{case (e, m) => e._1.hit(vpn, io.csr.satp.asid) && m._1 && !m._2 })
+    val vpn_reg = RegEnable(vpn, req.fire)
+    val hasS2xlate = req.bits.s2xlate =/= noS2xlate
+    val OnlyS2 = req.bits.s2xlate === onlyStage2
+    val OnlyS1 = req.bits.s2xlate === onlyStage1
+    val refill_mask = Mux(io.w.valid, UIntToOH(io.w.bits.wayIdx), 0.U(nWays.W))
+    val hitVec = VecInit((entries.zipWithIndex).zip(v zip refill_mask.asBools).map{
+      case (e, m) => {
+        val s2xlate_hit = e._1.s2xlate === req.bits.s2xlate
+        val hit = e._1.hit(vpn, Mux(hasS2xlate, io.csr.vsatp.asid, io.csr.satp.asid), vmid = io.csr.hgatp.vmid, hasS2xlate = hasS2xlate, onlyS2 = OnlyS2, onlyS1 = OnlyS1)
+        s2xlate_hit && hit && m._1 && !m._2
+      }
+    })
 
     hitVec.suggestName("hitVec")
 
-    val hitVecReg = if (sameCycle) hitVec else RegEnable(hitVec, req.fire())
+    val hitVecReg = RegEnable(hitVec, req.fire)
+    // Sector tlb may trigger multi-hit, see def "wbhit"
+    XSPerfAccumulate(s"port${i}_multi_hit", !(!resp.valid || (PopCount(hitVecReg) === 0.U || PopCount(hitVecReg) === 1.U)))
 
-    resp.valid := { if (sameCycle) req.valid else RegNext(req.valid) }
+    resp.valid := GatedValidRegNext(req.valid)
     resp.bits.hit := Cat(hitVecReg).orR
+    val reqVpn   = RegEnable(vpn, 0.U, req.fire)
+    val pbmt     = entries.map(_.pbmt)
+    val gpbmt    = entries.map(_.g_pbmt)
+    val perm     = entries.map(_.perm)
+    val gPerm    = entries.map(_.g_perm)
+    val s2xLate  = entries.map(_.s2xlate)
     if (nWays == 1) {
-      resp.bits.ppn := entries(0).genPPN(saveLevel, req.valid)(vpn_gen_ppn)
-      resp.bits.perm := entries(0).perm
+      for (d <- 0 until nDups) {
+        resp.bits.ppn(d) := entries(0).genPPN(saveLevel, resp.valid)(reqVpn)
+        resp.bits.pbmt(d) := pbmt(0)
+        resp.bits.g_pbmt(d) := gpbmt(0)
+        resp.bits.perm(d) := perm(0)
+        resp.bits.g_perm(d) := gPerm(0)
+        resp.bits.s2xlate(d) := s2xLate(0)
+      }
     } else {
-      resp.bits.ppn := ParallelMux(hitVecReg zip entries.map(_.genPPN(saveLevel, req.valid)(vpn_gen_ppn)))
-      resp.bits.perm := ParallelMux(hitVecReg zip entries.map(_.perm))
+      for (d <- 0 until nDups) {
+        resp.bits.ppn(d) := Mux1H(hitVecReg zip entries.map(_.genPPN(saveLevel, resp.valid)(reqVpn)))
+        resp.bits.pbmt(d) := Mux1H(hitVecReg zip pbmt)
+        resp.bits.g_pbmt(d) := Mux1H(hitVecReg zip gpbmt)
+        resp.bits.perm(d) := Mux1H(hitVecReg zip perm)
+        resp.bits.g_perm(d) := Mux1H(hitVecReg zip gPerm)
+        resp.bits.s2xlate(d) := Mux1H(hitVecReg zip s2xLate)
+      }
     }
-    io.r.resp_hit_sameCycle(i) := Cat(hitVec).orR
 
-    access.sets := get_set_idx(vpn_reg, nSets) // no use
+    access.sets := get_set_idx(vpn_reg(vpn_reg.getWidth - 1, sectortlbwidth), nSets) // no use
     access.touch_ways.valid := resp.valid && Cat(hitVecReg).orR
     access.touch_ways.bits := OHToUInt(hitVecReg)
 
     resp.bits.hit.suggestName("hit")
     resp.bits.ppn.suggestName("ppn")
+    resp.bits.pbmt.suggestName("pbmt")
+    resp.bits.g_pbmt.suggestName("g_pbmt")
     resp.bits.perm.suggestName("perm")
+    resp.bits.g_perm.suggestName("g_perm")
   }
 
   when (io.w.valid) {
     v(io.w.bits.wayIdx) := true.B
-    entries(io.w.bits.wayIdx).apply(io.w.bits.data, io.csr.satp.asid, io.w.bits.data_replenish)
+    entries(io.w.bits.wayIdx).apply(io.w.bits.data)
   }
+  // write assert, should not duplicate with the existing entries
+  val w_hit_vec = VecInit(entries.zip(v).map{case (e, vi) => e.wbhit(io.w.bits.data, Mux(io.w.bits.data.s2xlate =/= noS2xlate, io.csr.vsatp.asid, io.csr.satp.asid), io.csr.hgatp.vmid, s2xlate = io.w.bits.data.s2xlate) && vi })
+  XSError(io.w.valid && Cat(w_hit_vec).orR, s"${parentName} refill, duplicate with existing entries")
 
-  val refill_vpn_reg = RegNext(io.w.bits.data.entry.tag)
-  val refill_wayIdx_reg = RegNext(io.w.bits.wayIdx)
-  when (RegNext(io.w.valid)) {
+  val refill_vpn_reg = RegEnable(io.w.bits.data.s1.entry.tag, io.w.valid)
+  val refill_wayIdx_reg = RegEnable(io.w.bits.wayIdx, io.w.valid)
+  when (GatedValidRegNext(io.w.valid)) {
     io.access.map { access =>
       access.sets := get_set_idx(refill_vpn_reg, nSets)
       access.touch_ways.valid := true.B
@@ -94,223 +185,244 @@ class TLBFA(
   }
 
   val sfence = io.sfence
-  val sfence_vpn = sfence.bits.addr.asTypeOf(new VaBundle().cloneType).vpn
-  val sfenceHit = entries.map(_.hit(sfence_vpn, sfence.bits.asid))
-  val sfenceHit_noasid = entries.map(_.hit(sfence_vpn, sfence.bits.asid, ignoreAsid = true))
-  when (io.sfence.valid) {
+  val sfence_valid = sfence.valid && !sfence.bits.hg && !sfence.bits.hv
+  val sfence_vpn = sfence.bits.addr(VAddrBits - 1, offLen)
+  val sfenceHit = entries.map(_.hit(sfence_vpn, sfence.bits.id, vmid = io.csr.hgatp.vmid, hasS2xlate = io.csr.priv.virt))
+  val sfenceHit_noasid = entries.map(_.hit(sfence_vpn, sfence.bits.id, ignoreAsid = true, vmid = io.csr.hgatp.vmid, hasS2xlate = io.csr.priv.virt))
+  // Sfence will flush all sectors of an entry when hit
+  when (sfence_valid) {
     when (sfence.bits.rs1) { // virtual address *.rs1 <- (rs1===0.U)
       when (sfence.bits.rs2) { // asid, but i do not want to support asid, *.rs2 <- (rs2===0.U)
         // all addr and all asid
-        v.map(_ := false.B)
+        v.zipWithIndex.map{ case(a, i) => a := a && !((io.csr.priv.virt === false.B && entries(i).s2xlate === noS2xlate) ||
+          (io.csr.priv.virt && entries(i).s2xlate =/= noS2xlate && entries(i).vmid === io.csr.hgatp.vmid))}
       }.otherwise {
         // all addr but specific asid
-        v.zipWithIndex.map{ case (a,i) => a := a & (g(i) | !(entries(i).asid === sfence.bits.asid)) }
+        v.zipWithIndex.map{ case (a, i) => a := a && !(!g(i) && ((!io.csr.priv.virt && entries(i).s2xlate === noS2xlate && entries(i).asid === sfence.bits.id) ||
+          (io.csr.priv.virt && entries(i).s2xlate =/= noS2xlate && entries(i).asid === sfence.bits.id && entries(i).vmid === io.csr.hgatp.vmid)))}
       }
     }.otherwise {
       when (sfence.bits.rs2) {
         // specific addr but all asid
-        v.zipWithIndex.map{ case (a,i) => a := a & !sfenceHit_noasid(i) }
+        v.zipWithIndex.map{ case (a, i) => a := a & !sfenceHit_noasid(i) }
       }.otherwise {
         // specific addr and specific asid
-        v.zipWithIndex.map{ case (a,i) => a := a & !(sfenceHit(i) && !g(i)) }
+        v.zipWithIndex.map{ case (a, i) => a := a & !(sfenceHit(i) && !g(i)) }
       }
     }
   }
 
-  val victim_idx = io.w.bits.wayIdx
-  io.victim.out.valid := v(victim_idx) && io.w.valid && entries(victim_idx).level.getOrElse(3.U) === 2.U
-  io.victim.out.bits.entry := ns_to_n(entries(victim_idx))
-
-  def ns_to_n(ns: TlbEntry): TlbEntry = {
-    val n = Wire(new TlbEntry(pageNormal = true, pageSuper = false))
-    n.perm := ns.perm
-    n.ppn := ns.ppn
-    n.tag := ns.tag
-    n.asid := ns.asid
-    n
+  val hfencev_valid = sfence.valid && sfence.bits.hv
+  val hfenceg_valid = sfence.valid && sfence.bits.hg
+  val hfencev = io.sfence
+  val hfencev_vpn = sfence_vpn
+  val hfencevHit = entries.map(_.hit(hfencev_vpn, hfencev.bits.id, vmid = io.csr.hgatp.vmid, hasS2xlate = true.B))
+  val hfencevHit_noasid = entries.map(_.hit(hfencev_vpn, 0.U, ignoreAsid = true, vmid = io.csr.hgatp.vmid, hasS2xlate = true.B))
+  when (hfencev_valid) {
+    when (hfencev.bits.rs1) {
+      when (hfencev.bits.rs2) {
+        v.zipWithIndex.map { case (a, i) => a := a && !(entries(i).s2xlate =/= noS2xlate && entries(i).vmid === io.csr.hgatp.vmid)}
+      }.otherwise {
+        v.zipWithIndex.map { case (a, i) => a := a && !(!g(i) && (entries(i).s2xlate =/= noS2xlate && entries(i).asid === sfence.bits.id && entries(i).vmid === io.csr.hgatp.vmid))
+        }
+      }
+    }.otherwise {
+      when (hfencev.bits.rs2) {
+        v.zipWithIndex.map{ case (a, i) => a := a && !hfencevHit_noasid(i) }
+      }.otherwise {
+        v.zipWithIndex.map{ case (a, i) => a := a && !(hfencevHit(i) && !g(i)) }
+      }
+    }
   }
 
-  XSPerfAccumulate(s"access", io.r.resp.map(_.valid.asUInt()).fold(0.U)(_ + _))
-  XSPerfAccumulate(s"hit", io.r.resp.map(a => a.valid && a.bits.hit).fold(0.U)(_.asUInt() + _.asUInt()))
+
+  val hfenceg = io.sfence
+  val hfenceg_gvpn = (sfence.bits.addr << 2)(VAddrBits - 1, offLen)
+  when (hfenceg_valid) {
+    when(hfenceg.bits.rs2) {
+      v.zipWithIndex.map { case (a, i) => a := a && !(entries(i).s2xlate =/= noS2xlate) }
+    }.otherwise {
+      v.zipWithIndex.map { case (a, i) => a := a && !(entries(i).s2xlate =/= noS2xlate && entries(i).vmid === sfence.bits.id) }
+    }
+  }
+
+  XSPerfAccumulate(s"access", io.r.resp.map(_.valid.asUInt).fold(0.U)(_ + _))
+  XSPerfAccumulate(s"hit", io.r.resp.map(a => a.valid && a.bits.hit).fold(0.U)(_.asUInt + _.asUInt))
 
   for (i <- 0 until nWays) {
     XSPerfAccumulate(s"access${i}", io.r.resp.zip(io.access.map(acc => UIntToOH(acc.touch_ways.bits))).map{ case (a, b) =>
-      a.valid && a.bits.hit && b(i)}.fold(0.U)(_.asUInt() + _.asUInt()))
+      a.valid && a.bits.hit && b(i)}.fold(0.U)(_.asUInt + _.asUInt))
   }
   for (i <- 0 until nWays) {
     XSPerfAccumulate(s"refill${i}", io.w.valid && io.w.bits.wayIdx === i.U)
   }
 
   val perfEvents = Seq(
-    ("tlbstore_access", io.r.resp.map(_.valid.asUInt()).fold(0.U)(_ + _)                            ),
-    ("tlbstore_hit   ", io.r.resp.map(a => a.valid && a.bits.hit).fold(0.U)(_.asUInt() + _.asUInt())),
+    ("tlbstore_access", io.r.resp.map(_.valid.asUInt).fold(0.U)(_ + _)                            ),
+    ("tlbstore_hit   ", io.r.resp.map(a => a.valid && a.bits.hit).fold(0.U)(_.asUInt + _.asUInt)),
   )
   generatePerfEvent()
 
-  println(s"tlb_fa: nSets${nSets} nWays:${nWays}")
+  println(s"${parentName} tlb_fa: nSets${nSets} nWays:${nWays}")
 }
 
-@chiselName
-class TLBSA(
-  sameCycle: Boolean,
-  ports: Int,
-  nSets: Int,
-  nWays: Int,
-  sramSinglePort: Boolean,
-  normalPage: Boolean,
-  superPage: Boolean
-)(implicit p: Parameters) extends TlbModule {
-  require(!superPage, "super page should use reg/fa")
-  require(!sameCycle, "sram needs next cycle")
+class TLBFakeFA(
+             ports: Int,
+             nDups: Int,
+             nSets: Int,
+             nWays: Int,
+             useDmode: Boolean = false
+           )(implicit p: Parameters) extends TlbModule with HasCSRConst{
 
-  val io = IO(new TlbStorageIO(nSets, nWays, ports))
+  val io = IO(new TlbStorageIO(nSets, nWays, ports, nDups))
+  io.r.req.map(_.ready := true.B)
+  val mode = if (useDmode) io.csr.priv.dmode else io.csr.priv.imode
+  val vmEnable = if (EnbaleTlbDebug) (io.csr.satp.mode === 8.U)
+    else (io.csr.satp.mode === 8.U && (mode < ModeM))
 
-  io.r.req.map(_.ready := { if (sramSinglePort) !io.w.valid else true.B })
-  val v = RegInit(VecInit(Seq.fill(nSets)(VecInit(Seq.fill(nWays)(false.B)))))
-
-  for (i <- 0 until ports) { // duplicate sram
-    val entries = Module(new SRAMTemplate(
-      new TlbEntry(normalPage, superPage),
-      set = nSets,
-      way = nWays,
-      singlePort = sramSinglePort
-    ))
-
+  for (i <- 0 until ports) {
     val req = io.r.req(i)
     val resp = io.r.resp(i)
-    val access = io.access(i)
 
-    val vpn = req.bits.vpn
-    val vpn_reg = RegEnable(vpn, req.fire())
+    val helper = Module(new PTEHelper())
+    helper.clock := clock
+    helper.satp := io.csr.satp.ppn
+    helper.enable := req.fire && vmEnable
+    helper.vpn := req.bits.vpn
 
-    val ridx = get_set_idx(vpn, nSets)
-    val vidx = RegNext(Mux(req.fire(), v(ridx), VecInit(Seq.fill(nWays)(false.B))))
-    entries.io.r.req.valid := req.valid
-    entries.io.r.req.bits.apply(setIdx = ridx)
+    val pte = helper.pte.asTypeOf(new PteBundle)
+    val ppn = pte.ppn
+    val vpn_reg = RegEnable(req.bits.vpn, req.valid)
+    val pf = helper.pf
+    val level = helper.level
 
-    val data = entries.io.r.resp.data
-    val hitVec = VecInit(data.zip(vidx).map { case (e, vi) => e.hit(vpn_reg, io.csr.satp.asid, nSets) && vi })
-    resp.bits.hit := Cat(hitVec).orR && RegNext(req.ready, init = false.B)
-    if (nWays == 1) {
-      resp.bits.ppn := data(0).genPPN()(vpn_reg)
-      resp.bits.perm := data(0).perm
-    } else {
-      resp.bits.ppn := ParallelMux(hitVec zip data.map(_.genPPN()(vpn_reg)))
-      resp.bits.perm := ParallelMux(hitVec zip data.map(_.perm))
-    }
-    io.r.resp_hit_sameCycle(i) := DontCare
-
-    resp.valid := {
-      if (sramSinglePort) RegNext(req.fire()) else RegNext(req.valid)
-    }
-    resp.bits.hit.suggestName("hit")
-    resp.bits.ppn.suggestName("ppn")
-    resp.bits.perm.suggestName("perm")
-
-    access.sets := get_set_idx(vpn_reg, nSets) // no use
-    access.touch_ways.valid := resp.valid && Cat(hitVec).orR
-    access.touch_ways.bits := OHToUInt(hitVec)
-
-    entries.io.w.apply(
-      valid = io.w.valid || io.victim.in.valid,
-      setIdx = Mux(io.w.valid,
-        get_set_idx(io.w.bits.data.entry.tag, nSets),
-        get_set_idx(io.victim.in.bits.entry.tag, nSets)),
-      data = Mux(io.w.valid,
-        (Wire(new TlbEntry(normalPage, superPage)).apply(io.w.bits.data, io.csr.satp.asid, io.w.bits.data_replenish)),
-        io.victim.in.bits.entry),
-      waymask = UIntToOH(io.w.bits.wayIdx)
-    )
-  }
-
-  when (io.victim.in.valid) {
-    v(get_set_idx(io.victim.in.bits.entry.tag, nSets))(io.w.bits.wayIdx) := true.B
-  }
-  // w has higher priority than victim
-  when (io.w.valid) {
-    v(get_set_idx(io.w.bits.data.entry.tag, nSets))(io.w.bits.wayIdx) := true.B
-  }
-
-  val refill_vpn_reg = RegNext(Mux(io.victim.in.valid, io.victim.in.bits.entry.tag, io.w.bits.data.entry.tag))
-  val refill_wayIdx_reg = RegNext(io.w.bits.wayIdx)
-  when (RegNext(io.w.valid || io.victim.in.valid)) {
-    io.access.map { access =>
-      access.sets := get_set_idx(refill_vpn_reg, nSets)
-      access.touch_ways.valid := true.B
-      access.touch_ways.bits := refill_wayIdx_reg
-    }
-  }
-
-  val sfence = io.sfence
-  val sfence_vpn = sfence.bits.addr.asTypeOf(new VaBundle().cloneType).vpn
-  when (io.sfence.valid) {
-    when (sfence.bits.rs1) { // virtual address *.rs1 <- (rs1===0.U)
-        v.map(a => a.map(b => b := false.B))
-    }.otherwise {
-        // specific addr but all asid
-        v(get_set_idx(sfence_vpn, nSets)).map(_ := false.B)
-    }
-  }
-
-  io.victim.out := DontCare
-
-  XSPerfAccumulate(s"access", io.r.req.map(_.valid.asUInt()).fold(0.U)(_ + _))
-  XSPerfAccumulate(s"hit", io.r.resp.map(a => a.valid && a.bits.hit).fold(0.U)(_.asUInt() + _.asUInt()))
-
-  for (i <- 0 until nSets) {
-    for (j <- 0 until nWays) {
-      XSPerfAccumulate(s"refill${i}_${j}", (io.w.valid || io.victim.in.valid) &&
-        (Mux(io.w.valid, get_set_idx(io.w.bits.data.entry.tag, nSets), get_set_idx(io.victim.in.bits.entry.tag, nSets)) === i.U) &&
-        (j.U === io.w.bits.wayIdx)
+    resp.valid := GatedValidRegNext(req.valid)
+    resp.bits.hit := true.B
+    for (d <- 0 until nDups) {
+      resp.bits.perm(d).pf := pf
+      resp.bits.perm(d).af := false.B
+      resp.bits.perm(d).d := pte.perm.d
+      resp.bits.perm(d).a := pte.perm.a
+      resp.bits.perm(d).g := pte.perm.g
+      resp.bits.perm(d).u := pte.perm.u
+      resp.bits.perm(d).x := pte.perm.x
+      resp.bits.perm(d).w := pte.perm.w
+      resp.bits.perm(d).r := pte.perm.r
+      resp.bits.pbmt(d) := pte.pbmt
+      resp.bits.ppn(d) := MuxLookup(level, 0.U)(Seq(
+        0.U -> Cat(ppn(ppn.getWidth-1, vpnnLen*2), vpn_reg(vpnnLen*2-1, 0)),
+        1.U -> Cat(ppn(ppn.getWidth-1, vpnnLen), vpn_reg(vpnnLen-1, 0)),
+        2.U -> ppn)
       )
     }
   }
 
-  for (i <- 0 until nSets) {
-    for (j <- 0 until nWays) {
-      XSPerfAccumulate(s"hit${i}_${j}", io.r.resp.map(_.valid)
-        .zip(io.access.map(a => UIntToOH(a.touch_ways.bits)(j)))
-        .map{case(vi, hi) => vi && hi }
-        .zip(io.r.req.map(a => RegNext(get_set_idx(a.bits.vpn, nSets)) === i.U))
-        .map{a => (a._1 && a._2).asUInt()}
-        .fold(0.U)(_ + _)
-      )
-    }
-  }
-
-  for (i <- 0 until nSets) {
-    XSPerfAccumulate(s"access${i}", io.r.resp.map(_.valid)
-      .zip(io.r.req.map(a => RegNext(get_set_idx(a.bits.vpn, nSets)) === i.U))
-      .map{a => (a._1 && a._2).asUInt()}
-      .fold(0.U)(_ + _)
-    )
-  }
-
-  println(s"tlb_sa: nSets:${nSets} nWays:${nWays}")
+  io.access := DontCare
 }
 
 object TlbStorage {
   def apply
   (
-    name: String,
+    parentName: String,
     associative: String,
-    sameCycle: Boolean,
     ports: Int,
+    nDups: Int = 1,
     nSets: Int,
     nWays: Int,
-    sramSinglePort: Boolean,
     saveLevel: Boolean = false,
     normalPage: Boolean,
-    superPage: Boolean
+    superPage: Boolean,
+    useDmode: Boolean,
+    SoftTLB: Boolean
   )(implicit p: Parameters) = {
-    if (associative == "fa") {
-       val storage = Module(new TLBFA(sameCycle, ports, nSets, nWays, sramSinglePort, saveLevel, normalPage, superPage))
-       storage.suggestName(s"tlb_${name}_fa")
-       storage.io
+    if (SoftTLB) {
+      val storage = Module(new TLBFakeFA(ports, nDups, nSets, nWays, useDmode))
+      storage.suggestName(s"${parentName}_fake_fa")
+      storage.io
     } else {
-       val storage = Module(new TLBSA(sameCycle, ports, nSets, nWays, sramSinglePort, normalPage, superPage))
-       storage.suggestName(s"tlb_${name}_sa")
+       val storage = Module(new TLBFA(parentName, ports, nDups, nSets, nWays, saveLevel, normalPage, superPage))
+       storage.suggestName(s"${parentName}_fa")
        storage.io
     }
+  }
+}
+
+class TlbStorageWrapper(ports: Int, q: TLBParameters, nDups: Int = 1)(implicit p: Parameters) extends TlbModule {
+  val io = IO(new TlbStorageWrapperIO(ports, q, nDups))
+
+  val page = TlbStorage(
+    parentName = q.name + "_storage",
+    associative = q.Associative,
+    ports = ports,
+    nDups = nDups,
+    nSets = q.NSets,
+    nWays = q.NWays,
+    normalPage = true,
+    superPage = true,
+    useDmode = q.useDmode,
+    SoftTLB = coreParams.softTLB
+  )
+
+  for (i <- 0 until ports) {
+    page.r_req_apply(
+      valid = io.r.req(i).valid,
+      vpn = io.r.req(i).bits.vpn,
+      i = i,
+      s2xlate = io.r.req(i).bits.s2xlate
+    )
+  }
+
+  for (i <- 0 until ports) {
+    val q = page.r.req(i)
+    val p = page.r.resp(i)
+    val rq = io.r.req(i)
+    val rp = io.r.resp(i)
+    rq.ready := q.ready // actually, not used
+    rp.valid := p.valid // actually, not used
+    rp.bits.hit := p.bits.hit
+    for (d <- 0 until nDups) {
+      rp.bits.ppn(d) := p.bits.ppn(d)
+      rp.bits.perm(d).pf := p.bits.perm(d).pf
+      rp.bits.perm(d).af := p.bits.perm(d).af
+      rp.bits.perm(d).v := p.bits.perm(d).v
+      rp.bits.perm(d).d := p.bits.perm(d).d
+      rp.bits.perm(d).a := p.bits.perm(d).a
+      rp.bits.perm(d).g := p.bits.perm(d).g
+      rp.bits.perm(d).u := p.bits.perm(d).u
+      rp.bits.perm(d).x := p.bits.perm(d).x
+      rp.bits.perm(d).w := p.bits.perm(d).w
+      rp.bits.perm(d).r := p.bits.perm(d).r
+      rp.bits.s2xlate(d) := p.bits.s2xlate(d)
+      rp.bits.g_perm(d) := p.bits.g_perm(d)
+      rp.bits.pbmt(d) := p.bits.pbmt(d)
+      rp.bits.g_pbmt(d) := p.bits.g_pbmt(d)
+    }
+  }
+
+  page.sfence <> io.sfence
+  page.csr <> io.csr
+
+  val refill_idx = if (q.outReplace) {
+    io.replace.page.access <> page.access
+    io.replace.page.chosen_set := DontCare
+    io.replace.page.refillIdx
+  } else {
+    val re = ReplacementPolicy.fromString(q.Replacer, q.NWays)
+    re.access(page.access.map(_.touch_ways))
+    re.way
+  }
+
+  page.w_apply(
+    valid = io.w.valid,
+    wayIdx = refill_idx,
+    data = io.w.bits.data
+  )
+
+    // replacement
+  def get_access(one_hot: UInt, valid: Bool): Valid[UInt] = {
+    val res = Wire(Valid(UInt(log2Up(one_hot.getWidth).W)))
+    res.valid := Cat(one_hot).orR && valid
+    res.bits := OHToUInt(one_hot)
+    res
   }
 }

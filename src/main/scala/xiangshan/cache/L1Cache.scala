@@ -18,7 +18,7 @@
 
 package xiangshan.cache
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import xiangshan.{HasXSParameter, XSBundle, XSModule}
@@ -53,6 +53,7 @@ trait HasL1CacheParameters extends HasXSParameter
   def pgIdxBits = 12
   def pgUntagBits = untagBits min pgIdxBits
   def tagBits = PAddrBits - pgUntagBits
+  def vtagBits = VAddrBits - untagBits
 
   // the basic unit at which we store contents
   // SRAM bank width
@@ -72,11 +73,13 @@ trait HasL1CacheParameters extends HasXSParameter
   def wordBits = DataBits
   def wordBytes = wordBits / 8
   def wordOffBits = log2Up(wordBytes)
+  def quadWordOffBits = log2Up(QuadWordBytes)
   // the number of words in a block
   def blockWords = blockBytes / wordBytes
   def refillWords = refillBytes / wordBytes
 
-  def get_phy_tag(paddr: UInt) = (paddr >> pgUntagBits).asUInt()
+  def get_phy_tag(paddr: UInt) = (paddr >> pgUntagBits).asUInt
+  def get_vir_tag(vaddr: UInt) = (vaddr >> untagBits).asUInt
   def get_tag(addr: UInt) = get_phy_tag(addr)
   def get_idx(addr: UInt) = addr(untagBits-1, blockOffBits)
   def get_untag(addr: UInt) = addr(pgUntagBits-1, 0)
@@ -87,6 +90,7 @@ trait HasL1CacheParameters extends HasXSParameter
   def get_beat(addr: UInt) = addr(blockOffBits - 1, beatOffBits)
   def get_row(addr: UInt) = addr(blockOffBits - 1, rowOffBits)
   def get_word(addr: UInt) = addr(blockOffBits - 1, wordOffBits)
+  def get_quad_word(addr: UInt) = addr(blockOffBits - 1, quadWordOffBits)
 
   def beatRows = beatBits/rowBits
   def rowWords = rowBits/wordBits

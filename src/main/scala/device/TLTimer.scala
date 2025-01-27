@@ -19,10 +19,11 @@ package device
 import chisel3._
 import chisel3.util._
 import freechips.rocketchip.tilelink._
-import chipsalliance.rocketchip.config._
+import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper.RegField
-import utils.{HasTLDump, XSDebug}
+import utils.HasTLDump
+import utility.XSDebug
 
 class TLTimer(address: Seq[AddressSet], sim: Boolean, numCores: Int)(implicit p: Parameters) extends LazyModule {
 
@@ -64,10 +65,8 @@ class TLTimer(address: Seq[AddressSet], sim: Boolean, numCores: Int)(implicit p:
     node.regmap( mapping = clintMapping:_* )
 
     val in = node.in.head._1
-    when(in.a.valid){
-      XSDebug("[A] channel valid ready=%d ", in.a.ready)
-      in.a.bits.dump
-    }
+    XSDebug(in.a.valid, "[A] channel valid ready=%d ", in.a.ready)
+    in.a.bits.dump(in.a.valid)
 
     for (i <- 0 until numCores) {
       io.mtip(i) := RegNext(mtime >= mtimecmp(i))

@@ -12,15 +12,23 @@
 * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 *
 * See the Mulan PSL v2 for more details.
+*
+*
+* Acknowledgement
+*
+* This implementation is inspired by several key papers:
+* [1] Richard Kessler. "[The alpha 21264 microprocessor.](https://doi.org/10.1109/40.755465)" IEEE Micro 19.2: 24-36.
+* 1999.
 ***************************************************************************************/
 
 package xiangshan.mem.mdp
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import xiangshan._
 import utils._
+import utility._
 
 // 21264-like wait table, uses 2-bit counter
 class WaitTable(implicit p: Parameters) extends XSModule {
@@ -57,9 +65,7 @@ class WaitTable(implicit p: Parameters) extends XSModule {
   }
 
   // debug
-  when (io.update.valid) {
-    XSDebug("%d: waittable update: pc %x data: %x\n", GTimer(), io.update.waddr, io.update.wdata)
-  }
+  XSDebug(io.update.valid, "%d: waittable update: pc %x data: %x\n", GTimer(), io.update.waddr, io.update.wdata)
 
   XSPerfAccumulate("wait_table_bit_set", PopCount(data.map(d => d(1))))
 }

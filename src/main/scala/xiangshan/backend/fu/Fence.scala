@@ -16,28 +16,32 @@
 
 package xiangshan.backend.fu
 
-import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
+import org.chipsalliance.cde.config.Parameters
+import utility.XSDebug
+import xiangshan.ExceptionNO.{illegalInstr, virtualInstr}
 import xiangshan._
-import utils._
-import xiangshan.ExceptionNO.illegalInstr
+
+class FenceIO(implicit p: Parameters) extends XSBundle {
+  val sfence = Output(new SfenceBundle)
+  val fencei = Output(Bool())
+  val sbuffer = new FenceToSbuffer
+}
 
 class FenceToSbuffer extends Bundle {
   val flushSb = Output(Bool())
   val sbIsEmpty = Input(Bool())
 }
 
-class Fence(implicit p: Parameters) extends FunctionUnit {
+class Fence(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg) {
 
-  val sfence = IO(Output(new SfenceBundle))
-  val fencei = IO(Output(Bool()))
-  val toSbuffer = IO(new FenceToSbuffer)
-  val disableSfence = IO(Input(Bool()))
-
+  val sfence = io.fenceio.get.sfence
+  val fencei = io.fenceio.get.fencei
+  val toSbuffer = io.fenceio.get.sbuffer
   val (valid, src1) = (
     io.in.valid,
-    io.in.bits.src(0)
+    io.in.bits.data.src(0)
   )
 
   val s_idle :: s_wait :: s_tlb :: s_icache :: s_fence :: s_nofence :: Nil = Enum(6)
@@ -54,37 +58,40 @@ class Fence(implicit p: Parameters) extends FunctionUnit {
 
   val sbuffer = toSbuffer.flushSb
   val sbEmpty = toSbuffer.sbIsEmpty
-  val uop = RegEnable(io.in.bits.uop, io.in.fire())
+  val uop = RegEnable(io.in.bits, io.in.fire)
   val func = uop.ctrl.fuOpType
 
   // NOTE: icache & tlb & sbuffer must receive flush signal at any time
-  sbuffer      := state === s_wait && !(func === FenceOpType.sfence && disableSfence)
+  sbuffer      := state === s_wait
   fencei       := state === s_icache
-  sfence.valid := state === s_tlb && !disableSfence
-  sfence.bits.rs1  := uop.ctrl.imm(4, 0) === 0.U
-  sfence.bits.rs2  := uop.ctrl.imm(9, 5) === 0.U
-  XSError(sfence.valid && uop.ctrl.lsrc(0) =/= uop.ctrl.imm(4, 0), "lsrc0 is passed by imm\n")
-  XSError(sfence.valid && uop.ctrl.lsrc(1) =/= uop.ctrl.imm(9, 5), "lsrc1 is passed by imm\n")
-  sfence.bits.addr := RegEnable(io.in.bits.src(0), io.in.fire())
-  sfence.bits.asid := RegEnable(io.in.bits.src(1), io.in.fire())
+  sfence.valid := state === s_tlb && (func === FenceOpType.sfence || func === FenceOpType.hfence_v || func === FenceOpType.hfence_g)
+  sfence.bits.rs1  := uop.data.imm(4, 0) === 0.U
+  sfence.bits.rs2  := uop.data.imm(9, 5) === 0.U
+  sfence.bits.flushPipe := uop.ctrl.flushPipe.get
+  sfence.bits.hv := func === FenceOpType.hfence_v
+  sfence.bits.hg := func === FenceOpType.hfence_g
+  sfence.bits.addr := RegEnable(io.in.bits.data.src(0), io.in.fire)
+  sfence.bits.id   := RegEnable(io.in.bits.data.src(1), io.in.fire)
 
   when (state === s_idle && io.in.valid) { state := s_wait }
   when (state === s_wait && func === FenceOpType.fencei && sbEmpty) { state := s_icache }
-  when (state === s_wait && func === FenceOpType.sfence && (sbEmpty || disableSfence)) { state := s_tlb }
+  when (state === s_wait && ((func === FenceOpType.sfence || func === FenceOpType.hfence_g || func === FenceOpType.hfence_v) && sbEmpty)) { state := s_tlb }
   when (state === s_wait && func === FenceOpType.fence  && sbEmpty) { state := s_fence }
   when (state === s_wait && func === FenceOpType.nofence  && sbEmpty) { state := s_nofence }
   when (state =/= s_idle && state =/= s_wait) { state := s_idle }
 
   io.in.ready := state === s_idle
   io.out.valid := state =/= s_idle && state =/= s_wait
-  io.out.bits.data := DontCare
-  io.out.bits.uop := uop
-  io.out.bits.uop.cf.exceptionVec(illegalInstr) := func === FenceOpType.sfence && disableSfence
+  io.out.bits.res.data := 0.U
+  io.out.bits.ctrl.robIdx := uop.ctrl.robIdx
+  io.out.bits.ctrl.pdest := uop.ctrl.pdest
+  io.out.bits.ctrl.flushPipe.get := uop.ctrl.flushPipe.get
+  io.out.bits.ctrl.exceptionVec.get := 0.U.asTypeOf(io.out.bits.ctrl.exceptionVec.get)
+  io.out.bits.perfDebugInfo := io.in.bits.perfDebugInfo
 
-  XSDebug(io.in.valid, p"In(${io.in.valid} ${io.in.ready}) state:${state} Inpc:0x${Hexadecimal(io.in.bits.uop.cf.pc)} InrobIdx:${io.in.bits.uop.robIdx}\n")
+  XSDebug(io.in.valid, p"In(${io.in.valid} ${io.in.ready}) state:${state} InrobIdx:${io.in.bits.ctrl.robIdx}\n")
   XSDebug(state =/= s_idle, p"state:${state} sbuffer(flush:${sbuffer} empty:${sbEmpty}) fencei:${fencei} sfence:${sfence}\n")
-  XSDebug(io.out.valid, p" Out(${io.out.valid} ${io.out.ready}) state:${state} Outpc:0x${Hexadecimal(io.out.bits.uop.cf.pc)} OutrobIdx:${io.out.bits.uop.robIdx}\n")
+  XSDebug(io.out.valid, p" Out(${io.out.valid} ${io.out.ready}) state:${state} OutrobIdx:${io.out.bits.ctrl.robIdx}\n")
 
-  assert(!(io.out.valid && io.out.bits.uop.ctrl.rfWen))
   assert(!io.out.valid || io.out.ready, "when fence is out valid, out ready should always be true")
 }

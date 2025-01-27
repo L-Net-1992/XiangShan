@@ -30,7 +30,9 @@ trait HasXSDts {
       "device_type" -> "cpu".asProperty,
       "status" -> "okay".asProperty,
       "clock-frequency" -> 0.asProperty,
-      "riscv,isa" -> "rv64imafdc".asProperty,
+      "riscv,isa" -> "rv64imafdcvh".asProperty, // deprecated
+      "riscv,isa-base" -> ISABase.asProperty,
+      "riscv,isa-extensions" -> ISAExtensions.map(ResourceString),
       "timebase-frequency" -> 1000000.asProperty
     )
 
@@ -48,12 +50,12 @@ trait HasXSDts {
       )
 
       val dtlb = Map(
-        "d-tlb-size" -> (ldtlbParams.normalNSets * ldtlbParams.normalNWays).asProperty,
+        "d-tlb-size" -> (ldtlbParams.NSets * ldtlbParams.NWays).asProperty,
         "d-tlb-sets" -> 1.asProperty
       )
 
       val itlb = Map(
-        "i-tlb-size" -> (itlbParams.normalNSets * itlbParams.normalNWays).asProperty,
+        "i-tlb-size" -> (itlbParams.NSets * itlbParams.NWays).asProperty,
         "i-tlb-sets" -> 1.asProperty
       )
 
@@ -69,7 +71,7 @@ trait HasXSDts {
 
     def nextLevelCacheProperty: PropertyOption = {
       if(coreParams.dcacheParametersOpt.nonEmpty){
-        val outer = memBlock.dcache.clientNode.edges.out.flatMap(_.manager.managers)
+        val outer = memBlock.inner.dcache.clientNode.edges.out.flatMap(_.manager.managers)
           .filter(_.supportsAcquireB)
           .flatMap(_.resources.headOption)
           .map(_.owner.label)
@@ -98,12 +100,12 @@ trait HasXSDts {
   ResourceBinding {
     Resource(device, "reg").bind(ResourceAddress(coreParams.HartId))
     val int_resources = (
-      clint_int_sink.edges.in.flatMap(_.source.sources) ++
-      plic_int_sink.edges.in.flatMap(_.source.sources) ++
-      debug_int_sink.edges.in.flatMap(_.source.sources)
+      memBlock.inner.clint_int_sink.edges.in.flatMap(_.source.sources) ++
+      memBlock.inner.plic_int_sink.edges.in.flatMap(_.source.sources) ++
+      memBlock.inner.debug_int_sink.edges.in.flatMap(_.source.sources) ++
+      memBlock.inner.nmi_int_sink.edges.in.flatMap(_.source.sources)
       ).flatMap {
       s =>
-        println(s.resources.map(_.key), s.range)
         (s.range.start until s.range.`end`).map(_ => s.resources)
     }
     val int_ids = Seq(
@@ -111,7 +113,9 @@ trait HasXSDts {
       7,    // mtip  [clint]
       11,   // meip  [plic]
       9,    // seip  [plic]
-      65535 // debug [debug]
+      65535, // debug [debug]
+      31,   // nmi_31 [nmi]
+      43    // nmi_43 [nmi]
     )
     assert(int_resources.size == int_ids.size)
     for((resources, id) <- int_resources.zip(int_ids)){

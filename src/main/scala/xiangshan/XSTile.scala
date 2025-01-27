@@ -1,168 +1,204 @@
+/***************************************************************************************
+* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2020-2021 Peng Cheng Laboratory
+*
+* XiangShan is licensed under Mulan PSL v2.
+* You can use this software according to the terms and conditions of the Mulan PSL v2.
+* You may obtain a copy of Mulan PSL v2 at:
+*          http://license.coscl.org.cn/MulanPSL2
+*
+* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+* EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+* MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+*
+* See the Mulan PSL v2 for more details.
+***************************************************************************************/
+
 package xiangshan
 
+import org.chipsalliance.cde.config.{Config, Parameters}
 import chisel3._
-import chipsalliance.rocketchip.config.{Config, Parameters}
-import chisel3.util.{Valid, ValidIO}
-import freechips.rocketchip.diplomacy.{BundleBridgeSink, LazyModule, LazyModuleImp, LazyModuleImpLike}
-import freechips.rocketchip.interrupts.{IntSinkNode, IntSinkPortParameters, IntSinkPortSimple}
+import chisel3.util.{Valid, ValidIO, log2Up}
+import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.interrupts._
 import freechips.rocketchip.tile.{BusErrorUnit, BusErrorUnitParams, BusErrors}
-import freechips.rocketchip.tilelink.{BankBinder, TLBuffer, TLIdentityNode, TLNode, TLTempNode, TLXbar}
-import huancun.debug.TLLogger
-import huancun.{HCCacheParamsKey, HuanCun}
+import freechips.rocketchip.tilelink._
+import freechips.rocketchip.amba.axi4._
+import device.MsiInfoBundle
 import system.HasSoCParameter
-import top.BusPerfMonitor
-import utils.{DelayN, ResetGen, TLClientsMerger, TLEdgeBuffer}
-
-class L1BusErrorUnitInfo(implicit val p: Parameters) extends Bundle with HasSoCParameter {
-  val ecc_error = Valid(UInt(soc.PAddrBits.W)) 
-}
-
-class XSL1BusErrors()(implicit val p: Parameters) extends BusErrors {
-  val icache = new L1BusErrorUnitInfo
-  val dcache = new L1BusErrorUnitInfo
-  val l2 = new L1BusErrorUnitInfo
-
-  override def toErrorList: List[Option[(ValidIO[UInt], String, String)]] =
-    List(
-      Some(icache.ecc_error, "I_ECC", "Icache ecc error"),
-      Some(dcache.ecc_error, "D_ECC", "Dcache ecc error"),
-      Some(l2.ecc_error, "L2_ECC", "L2Cache ecc error")
-    )
-}
-
-/**
-  *   XSTileMisc contains every module except Core and L2 Cache
-  */
-class XSTileMisc()(implicit p: Parameters) extends LazyModule
-  with HasXSParameter
-  with HasSoCParameter
-{
-  val l1_xbar = TLXbar()
-  val mmio_xbar = TLXbar()
-  val mmio_port = TLIdentityNode() // to L3
-  val memory_port = TLIdentityNode()
-  val beu = LazyModule(new BusErrorUnit(
-    new XSL1BusErrors(), BusErrorUnitParams(0x38010000)
-  ))
-  val busPMU = BusPerfMonitor(enable = !debugOpts.FPGAPlatform)
-  val l1d_logger = TLLogger(s"L2_L1D_${coreParams.HartId}", !debugOpts.FPGAPlatform)
-  val l2_binder = coreParams.L2CacheParamsOpt.map(_ => BankBinder(coreParams.L2NBanks, 64))
-
-  val i_mmio_port = TLTempNode()
-  val d_mmio_port = TLTempNode()
-
-  busPMU := l1d_logger
-  l1_xbar :=* busPMU
-
-  l2_binder match {
-    case Some(binder) =>
-      memory_port := TLBuffer.chainNode(2) := TLClientsMerger() := TLXbar() :=* binder
-    case None =>
-      memory_port := l1_xbar
-  }
-
-  mmio_xbar := TLBuffer.chainNode(2) := i_mmio_port
-  mmio_xbar := TLBuffer.chainNode(2) := d_mmio_port
-  beu.node := TLBuffer.chainNode(1) := mmio_xbar
-  mmio_port := TLBuffer() := mmio_xbar
-
-  lazy val module = new LazyModuleImp(this){
-    val beu_errors = IO(Input(chiselTypeOf(beu.module.io.errors)))
-    beu.module.io.errors <> beu_errors
-  }
-}
+import top.{BusPerfMonitor, ArgParser, Generator}
+import utility.{DelayN, ResetGen, TLClientsMerger, TLEdgeBuffer, TLLogger, Constantin, ChiselDB, FileRegisters}
+import coupledL2.EnableCHI
+import coupledL2.tl2chi.PortIO
+import xiangshan.backend.trace.TraceCoreInterface
 
 class XSTile()(implicit p: Parameters) extends LazyModule
   with HasXSParameter
   with HasSoCParameter
 {
-  private val core = LazyModule(new XSCore())
-  private val misc = LazyModule(new XSTileMisc())
-  private val l2cache = coreParams.L2CacheParamsOpt.map(l2param =>
-    LazyModule(new HuanCun()(new Config((_, _, _) => {
-      case HCCacheParamsKey => l2param
-    })))
-  )
+  override def shouldBeInlined: Boolean = false
+  val core = LazyModule(new XSCore())
+  val l2top = LazyModule(new L2Top())
 
-  // public ports
-  val memory_port = misc.memory_port
-  val uncache = misc.mmio_port
-  val clint_int_sink = core.clint_int_sink
-  val plic_int_sink = core.plic_int_sink
-  val debug_int_sink = core.debug_int_sink
-  val beu_int_source = misc.beu.intNode
-  val core_reset_sink = BundleBridgeSink(Some(() => Bool()))
+  val enableL2 = coreParams.L2CacheParamsOpt.isDefined
+  // =========== Public Ports ============
+  val memBlock = core.memBlock.inner
+  val core_l3_pf_port = memBlock.l3_pf_sender_opt
+  val memory_port = if (enableCHI && enableL2) None else Some(l2top.inner.memory_port.get)
+  val tl_uncache = l2top.inner.mmio_port
+  // val axi4_uncache = if (enableCHI) Some(AXI4UserYanker()) else None
+  val beu_int_source = l2top.inner.beu.intNode
+  val core_reset_sink = BundleBridgeSink(Some(() => Reset()))
+  val clint_int_node = l2top.inner.clint_int_node
+  val plic_int_node = l2top.inner.plic_int_node
+  val debug_int_node = l2top.inner.debug_int_node
+  val nmi_int_node = l2top.inner.nmi_int_node
+  memBlock.clint_int_sink := clint_int_node
+  memBlock.plic_int_sink :*= plic_int_node
+  memBlock.debug_int_sink := debug_int_node
+  memBlock.nmi_int_sink := nmi_int_node
 
-  val l1d_to_l2_bufferOpt = coreParams.dcacheParametersOpt.map { _ =>
-    val buffer = LazyModule(new TLBuffer)
-    misc.l1d_logger := buffer.node := core.memBlock.dcache.clientNode
-    buffer
+  // =========== Components' Connection ============
+  // L1 to l1_xbar
+  coreParams.dcacheParametersOpt.map { _ =>
+    l2top.inner.misc_l2_pmu := l2top.inner.l1d_logger := memBlock.dcache_port :=
+      memBlock.l1d_to_l2_buffer.node := memBlock.dcache.clientNode
   }
 
-  val l1i_to_l2_buffer = LazyModule(new TLBuffer)
-  misc.busPMU :=
-    TLLogger(s"L2_L1I_${coreParams.HartId}", !debugOpts.FPGAPlatform) :=
-    l1i_to_l2_buffer.node :=
-    core.frontend.icache.clientNode
+  l2top.inner.misc_l2_pmu := l2top.inner.l1i_logger := memBlock.frontendBridge.icache_node
+  if (!coreParams.softPTW) {
+    l2top.inner.misc_l2_pmu := l2top.inner.ptw_logger := l2top.inner.ptw_to_l2_buffer.node := memBlock.ptw_to_l2_buffer.node
+  }
 
-  val ptw_to_l2_bufferOpt = if (!coreParams.softPTW) {
-    val buffer = LazyModule(new TLBuffer)
-    misc.busPMU :=
-      TLLogger(s"L2_PTW_${coreParams.HartId}", !debugOpts.FPGAPlatform) :=
-      buffer.node :=
-      core.ptw_to_l2_buffer.node
-    Some(buffer)
-  } else None
-
-  l2cache match {
+  // L2 Prefetch
+  l2top.inner.l2cache match {
     case Some(l2) =>
-      misc.l2_binder.get :*= l2.node :*= TLBuffer() :*= misc.l1_xbar
+      l2.pf_recv_node.foreach(recv => {
+        println("Connecting L1 prefetcher to L2!")
+        recv := memBlock.l2_pf_sender_opt.get
+      })
     case None =>
   }
 
-  misc.i_mmio_port := core.frontend.instrUncache.clientNode
-  misc.d_mmio_port := core.memBlock.uncache.clientNode
+  val core_l3_tpmeta_source_port = l2top.inner.l2cache match {
+    case Some(l2) => l2.tpmeta_source_node
+    case None => None
+  }
+  val core_l3_tpmeta_sink_port = l2top.inner.l2cache match {
+    case Some(l2) => l2.tpmeta_sink_node
+    case None => None
+  }
 
-  lazy val module = new LazyModuleImp(this){
+  // mmio
+  l2top.inner.i_mmio_port := l2top.inner.i_mmio_buffer.node := memBlock.frontendBridge.instr_uncache_node
+  if (icacheParameters.cacheCtrlAddressOpt.nonEmpty) {
+    memBlock.frontendBridge.icachectrl_node := l2top.inner.icachectrl_port_opt.get
+  }
+  l2top.inner.d_mmio_port := memBlock.uncache_port
+
+  // =========== IO Connection ============
+  class XSTileImp(wrapper: LazyModule) extends LazyModuleImp(wrapper) {
     val io = IO(new Bundle {
-      val hartId = Input(UInt(64.W))
+      val hartId = Input(UInt(hartIdLen.W))
+      val msiInfo = Input(ValidIO(new MsiInfoBundle))
       val reset_vector = Input(UInt(PAddrBits.W))
       val cpu_halt = Output(Bool())
+      val cpu_poff = Output(Bool())
+      val cpu_crtical_error = Output(Bool())
+      val hartIsInReset = Output(Bool())
+      val traceCoreInterface = new TraceCoreInterface
+      val debugTopDown = new Bundle {
+        val robHeadPaddr = Valid(UInt(PAddrBits.W))
+        val l3MissMatch = Input(Bool())
+      }
+      val l3Miss = Input(Bool())
+      val chi = if (enableCHI) Some(new PortIO) else None
+      val nodeID = if (enableCHI) Some(Input(UInt(NodeIDWidth.W))) else None
+      val clintTime = Input(ValidIO(UInt(64.W)))
     })
 
     dontTouch(io.hartId)
+    dontTouch(io.msiInfo)
+    dontTouch(io.cpu_poff)
+    if (!io.chi.isEmpty) { dontTouch(io.chi.get) }
 
-    val core_soft_rst = core_reset_sink.in.head._1
+    val core_soft_rst = core_reset_sink.in.head._1 // unused
 
-    core.module.io.hartId := io.hartId
-    core.module.io.reset_vector := DelayN(io.reset_vector, 5)
-    io.cpu_halt := core.module.io.cpu_halt
-    if(l2cache.isDefined){
-      core.module.io.perfEvents.zip(l2cache.get.module.io.perfEvents.flatten).foreach(x => x._1.value := x._2)
-    }
-    else {
+    l2top.module.io.hartId.fromTile := io.hartId
+    core.module.io.hartId := l2top.module.io.hartId.toCore
+    core.module.io.reset_vector := l2top.module.io.reset_vector.toCore
+    core.module.io.msiInfo := l2top.module.io.msiInfo.toCore
+    l2top.module.io.msiInfo.fromTile := io.msiInfo
+    core.module.io.clintTime := l2top.module.io.clintTime.toCore
+    l2top.module.io.clintTime.fromTile := io.clintTime
+    l2top.module.io.reset_vector.fromTile := io.reset_vector
+    l2top.module.io.cpu_halt.fromCore := core.module.io.cpu_halt
+    io.cpu_halt := l2top.module.io.cpu_halt.toTile
+    l2top.module.io.cpu_critical_error.fromCore := core.module.io.cpu_critical_error
+    io.cpu_crtical_error := l2top.module.io.cpu_critical_error.toTile
+
+    l2top.module.io.hartIsInReset.resetInFrontend := core.module.io.resetInFrontend
+    io.hartIsInReset := l2top.module.io.hartIsInReset.toTile
+    l2top.module.io.traceCoreInterface.fromCore <> core.module.io.traceCoreInterface
+    io.traceCoreInterface <> l2top.module.io.traceCoreInterface.toTile
+
+    l2top.module.io.beu_errors.icache <> core.module.io.beu_errors.icache
+    l2top.module.io.beu_errors.dcache <> core.module.io.beu_errors.dcache
+
+    //lower power
+    l2top.module.io.l2_flush_en := core.module.io.l2_flush_en
+    core.module.io.l2_flush_done := l2top.module.io.l2_flush_done
+    io.cpu_poff := l2top.module.io.cpu_poff.toTile
+    l2top.module.io.cpu_poff.fromCore := core.module.io.power_down_en
+    if (enableL2) {
+      // TODO: add ECC interface of L2
+      l2top.module.io.pfCtrlFromCore := core.module.io.l2PfCtrl
+
+      l2top.module.io.beu_errors.l2 <> 0.U.asTypeOf(l2top.module.io.beu_errors.l2)
+      core.module.io.l2_hint.bits.sourceId := l2top.module.io.l2_hint.bits.sourceId
+      core.module.io.l2_hint.bits.isKeyword := l2top.module.io.l2_hint.bits.isKeyword
+      core.module.io.l2_hint.valid := l2top.module.io.l2_hint.valid
+
+      core.module.io.l2PfqBusy := false.B
+      core.module.io.debugTopDown.l2MissMatch := l2top.module.io.debugTopDown.l2MissMatch
+      l2top.module.io.debugTopDown.robHeadPaddr := core.module.io.debugTopDown.robHeadPaddr
+      l2top.module.io.debugTopDown.robTrueCommit := core.module.io.debugTopDown.robTrueCommit
+      l2top.module.io.l2_pmp_resp := core.module.io.l2_pmp_resp
+      core.module.io.l2_tlb_req <> l2top.module.io.l2_tlb_req
+      core.module.io.topDownInfo.l2Miss := l2top.module.io.l2Miss
+
+      core.module.io.perfEvents <> l2top.module.io.perfEvents
+    } else {
+
+      l2top.module.io.beu_errors.l2 <> 0.U.asTypeOf(l2top.module.io.beu_errors.l2)
+      core.module.io.l2_hint.bits.sourceId := l2top.module.io.l2_hint.bits.sourceId
+      core.module.io.l2_hint.bits.isKeyword := l2top.module.io.l2_hint.bits.isKeyword
+      core.module.io.l2_hint.valid := l2top.module.io.l2_hint.valid
+
+      core.module.io.l2PfqBusy := false.B
+      core.module.io.debugTopDown.l2MissMatch := false.B
+      core.module.io.topDownInfo.l2Miss := false.B
+
+      core.module.io.l2_tlb_req.req.valid := false.B
+      core.module.io.l2_tlb_req.req.bits := DontCare
+      core.module.io.l2_tlb_req.req_kill := DontCare
+      core.module.io.l2_tlb_req.resp.ready := true.B
+
       core.module.io.perfEvents <> DontCare
     }
 
-    misc.module.beu_errors.icache <> core.module.io.beu_errors.icache
-    misc.module.beu_errors.dcache <> core.module.io.beu_errors.dcache
-    if(l2cache.isDefined){
-      misc.module.beu_errors.l2.ecc_error.valid := l2cache.get.module.io.ecc_error.valid
-      misc.module.beu_errors.l2.ecc_error.bits := l2cache.get.module.io.ecc_error.bits
-    } else {
-      misc.module.beu_errors.l2 <> 0.U.asTypeOf(misc.module.beu_errors.l2)
-    }
+    io.debugTopDown.robHeadPaddr := core.module.io.debugTopDown.robHeadPaddr
+    core.module.io.debugTopDown.l3MissMatch := io.debugTopDown.l3MissMatch
+    l2top.module.io.l3Miss.fromTile := io.l3Miss
+    core.module.io.topDownInfo.l3Miss := l2top.module.io.l3Miss.toCore
 
-    // Modules are reset one by one
-    // io_reset ----
-    //             |
-    //             v
-    // reset ----> OR_SYNC --> {Misc, L2 Cache, Cores}
-    val resetChain = Seq(
-      Seq(misc.module, core.module, l1i_to_l2_buffer.module) ++
-        l2cache.map(_.module) ++
-        l1d_to_l2_bufferOpt.map(_.module) ++ ptw_to_l2_bufferOpt.map(_.module)
-    )
-    ResetGen(resetChain, reset.asBool || core_soft_rst, !debugOpts.FPGAPlatform)
+    io.chi.foreach(_ <> l2top.module.io.chi.get)
+    l2top.module.io.nodeID.foreach(_ := io.nodeID.get)
+
+    if (debugOpts.ResetGen && enableL2) {
+      core.module.reset := l2top.module.reset_core
+    }
   }
+
+  lazy val module = new XSTileImp(this)
 }

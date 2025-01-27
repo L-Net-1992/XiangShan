@@ -16,37 +16,68 @@
 
 package xiangshan.backend.rename.freelist
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import xiangshan._
+import xiangshan.backend.rename.SnapshotGenerator
 import utils._
+import utility._
 
 
-abstract class BaseFreeList(size: Int)(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelper {
+abstract class BaseFreeList(size: Int, numLogicRegs:Int = 32)(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelper {
   val io = IO(new Bundle {
     val redirect = Input(Bool())
     val walk = Input(Bool())
 
     val allocateReq = Input(Vec(RenameWidth, Bool()))
+    val walkReq = Input(Vec(RabCommitWidth, Bool()))
     val allocatePhyReg = Output(Vec(RenameWidth, UInt(PhyRegIdxWidth.W)))
     val canAllocate = Output(Bool())
     val doAllocate = Input(Bool())
 
-    val freeReq = Input(Vec(CommitWidth, Bool()))
-    val freePhyReg = Input(Vec(CommitWidth, UInt(PhyRegIdxWidth.W)))
+    val freeReq = Input(Vec(RabCommitWidth, Bool()))
+    val freePhyReg = Input(Vec(RabCommitWidth, UInt(PhyRegIdxWidth.W)))
 
-    val stepBack = Input(UInt(log2Up(CommitWidth + 1).W))
+    val commit = Input(new RabCommitIO)
+
+    val snpt = Input(new SnapshotPort)
+
+    val debug_rat = if(backendParams.debugEn) Some(Vec(numLogicRegs, Input(UInt(PhyRegIdxWidth.W)))) else None
   })
 
   class FreeListPtr extends CircularQueuePtr[FreeListPtr](size)
 
   object FreeListPtr {
-    def apply(f: Bool, v: UInt): FreeListPtr = {
+    def apply(f: Boolean, v: Int): FreeListPtr = {
       val ptr = Wire(new FreeListPtr)
-      ptr.flag := f
-      ptr.value := v
+      ptr.flag := f.B
+      ptr.value := v.U
       ptr
     }
   }
+
+  val lastCycleRedirect = RegNext(RegNext(io.redirect))
+  val lastCycleSnpt = RegNext(RegNext(io.snpt, 0.U.asTypeOf(io.snpt)))
+
+  val headPtr = RegInit(FreeListPtr(false, 0))
+  val headPtrOH = RegInit(1.U(size.W))
+  val archHeadPtr = RegInit(FreeListPtr(false, 0))
+  XSError(headPtr.toOH =/= headPtrOH, p"wrong one-hot reg between $headPtr and $headPtrOH")
+  val headPtrOHShift = CircularShift(headPtrOH)
+  // may shift [0, RenameWidth] steps
+  val headPtrOHVec = VecInit.tabulate(RenameWidth + 1)(headPtrOHShift.left)
+
+  val snapshots = SnapshotGenerator(headPtr, io.snpt.snptEnq, io.snpt.snptDeq, io.redirect, io.snpt.flushVec)
+
+  val redirectedHeadPtr = Mux(
+    lastCycleSnpt.useSnpt,
+    snapshots(lastCycleSnpt.snptSelect) + PopCount(io.walkReq),
+    archHeadPtr + PopCount(io.walkReq)
+  )
+  val redirectedHeadPtrOH = Mux(
+    lastCycleSnpt.useSnpt,
+    (snapshots(lastCycleSnpt.snptSelect) + PopCount(io.walkReq)).toOH,
+    (archHeadPtr + PopCount(io.walkReq)).toOH
+  )
 }

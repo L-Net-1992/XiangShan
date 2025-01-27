@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -18,14 +19,14 @@
 
 package xiangshan.backend.fu
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
-import chisel3.internal.naming.chiselName
 import chisel3.util._
-import utils.MaskedRegMap.WritableMask
+import utility.MaskedRegMap.WritableMask
 import xiangshan._
 import xiangshan.backend.fu.util.HasCSRConst
 import utils._
+import utility._
 import xiangshan.cache.mmu.{TlbCmd, TlbExceptionBundle}
 
 trait PMPConst extends HasPMParameters {
@@ -37,7 +38,6 @@ abstract class PMPBundle(implicit val p: Parameters) extends Bundle with PMPCons
 abstract class PMPModule(implicit val p: Parameters) extends Module with PMPConst
 abstract class PMPXSModule(implicit p: Parameters) extends XSModule with PMPConst
 
-@chiselName
 class PMPConfig(implicit p: Parameters) extends PMPBundle {
   val l = Bool()
   val c = Bool() // res(1), unuse in pmp
@@ -60,18 +60,40 @@ class PMPConfig(implicit p: Parameters) extends PMPBundle {
   def addr_locked(next: PMPConfig): Bool = locked || (next.locked && next.tor)
 }
 
+object PMPConfigUInt {
+  def apply(
+    l: Boolean = false,
+    c: Boolean = false,
+    atomic: Boolean = false,
+    a: Int = 0,
+    x: Boolean = false,
+    w: Boolean = false,
+    r: Boolean = false)(implicit p: Parameters): UInt = {
+    var config = 0
+    if (l) { config += (1 << 7) }
+    if (c) { config += (1 << 6) }
+    if (atomic) { config += (1 << 5) }
+    if (a > 0) { config += (a << 3) }
+    if (x) { config += (1 << 2) }
+    if (w) { config += (1 << 1) }
+    if (r) { config += (1 << 0) }
+    config.U(8.W)
+  }
+}
 trait PMPReadWriteMethodBare extends PMPConst {
   def match_mask(cfg: PMPConfig, paddr: UInt) = {
     val match_mask_c_addr = Cat(paddr, cfg.a(0)) | (((1 << PlatformGrain) - 1) >> PMPOffBits).U((paddr.getWidth + 1).W)
     Cat(match_mask_c_addr & ~(match_mask_c_addr + 1.U), ((1 << PMPOffBits) - 1).U(PMPOffBits.W))
   }
 
-  def write_cfg_vec(mask: Vec[UInt], addr: Vec[UInt], index: Int)(cfgs: UInt): UInt = {
+  def write_cfg_vec(mask: Vec[UInt], addr: Vec[UInt], index: Int, oldcfg: UInt)(cfgs: UInt): UInt = {
     val cfgVec = Wire(Vec(cfgs.getWidth/8, new PMPConfig))
     for (i <- cfgVec.indices) {
       val cfg_w_m_tmp = cfgs((i+1)*8-1, i*8).asUInt.asTypeOf(new PMPConfig)
-      cfgVec(i) := cfg_w_m_tmp
-      when (!cfg_w_m_tmp.l) {
+      val cfg_old_tmp = oldcfg((i+1)*8-1, i*8).asUInt.asTypeOf(new PMPConfig)
+      cfgVec(i) := cfg_old_tmp
+      when (!cfg_old_tmp.l) {
+        cfgVec(i) := cfg_w_m_tmp
         cfgVec(i).w := cfg_w_m_tmp.w && cfg_w_m_tmp.r
         if (CoarserGrain) { cfgVec(i).a := Cat(cfg_w_m_tmp.a(1), cfg_w_m_tmp.a.orR) }
         when (cfgVec(i).na4_napot) {
@@ -115,12 +137,14 @@ trait PMPReadWriteMethodBare extends PMPConst {
 }
 
 trait PMPReadWriteMethod extends PMPReadWriteMethodBare  { this: PMPBase =>
-  def write_cfg_vec(cfgs: UInt): UInt = {
+  def write_cfg_vec(oldcfg: UInt)(cfgs: UInt): UInt = {
     val cfgVec = Wire(Vec(cfgs.getWidth/8, new PMPConfig))
     for (i <- cfgVec.indices) {
       val cfg_w_tmp = cfgs((i+1)*8-1, i*8).asUInt.asTypeOf(new PMPConfig)
-      cfgVec(i) := cfg_w_tmp
-      when (!cfg_w_tmp.l) {
+      val cfg_old_tmp = oldcfg((i+1)*8-1, i*8).asUInt.asTypeOf(new PMPConfig)
+      cfgVec(i) := cfg_old_tmp
+      when (!cfg_old_tmp.l) {
+        cfgVec(i) := cfg_w_tmp
         cfgVec(i).w := cfg_w_tmp.w && cfg_w_tmp.r
         if (CoarserGrain) { cfgVec(i).a := Cat(cfg_w_tmp.a(1), cfg_w_tmp.a.orR) }
       }
@@ -152,7 +176,6 @@ trait PMPReadWriteMethod extends PMPReadWriteMethodBare  { this: PMPBase =>
 /** PMPBase for CSR unit
   * with only read and write logic
   */
-@chiselName
 class PMPBase(implicit p: Parameters) extends PMPBundle with PMPReadWriteMethod {
   val cfg = new PMPConfig
   val addr = UInt((PMPAddrBits - PMPOffBits).W)
@@ -242,7 +265,6 @@ trait PMPMatchMethod extends PMPConst { this: PMPEntry =>
   * with one more elements mask to help napot match
   * TODO: make mask an element, not an method, for timing opt
   */
-@chiselName
 class PMPEntry(implicit p: Parameters) extends PMPBase with PMPMatchMethod {
   val mask = UInt(PMPAddrBits.W) // help to match in napot
 
@@ -267,10 +289,11 @@ class PMPEntry(implicit p: Parameters) extends PMPBase with PMPMatchMethod {
 trait PMPMethod extends PMPConst {
   def pmp_init() : (Vec[UInt], Vec[UInt], Vec[UInt])= {
     val cfg = WireInit(0.U.asTypeOf(Vec(NumPMP/8, UInt(PMXLEN.W))))
-    val addr = Wire(Vec(NumPMP, UInt((PMPAddrBits-PMPOffBits).W)))
-    val mask = Wire(Vec(NumPMP, UInt(PMPAddrBits.W)))
-    addr := DontCare
-    mask := DontCare
+    // val addr = Wire(Vec(NumPMP, UInt((PMPAddrBits-PMPOffBits).W)))
+    // val mask = Wire(Vec(NumPMP, UInt(PMPAddrBits.W)))
+    // INFO: these CSRs could be uninitialized, but for difftesting with NEMU, we opt to initialize them.
+    val addr = WireInit(0.U.asTypeOf(Vec(NumPMP, UInt((PMPAddrBits-PMPOffBits).W))))
+    val mask = WireInit(0.U.asTypeOf(Vec(NumPMP, UInt(PMPAddrBits.W))))
     (cfg, addr, mask)
   }
 
@@ -300,7 +323,7 @@ trait PMPMethod extends PMPConst {
         addr = cfgBase + pmpCfgIndex(i),
         reg = cfgMerged(i/pmpCfgPerCSR),
         wmask = WritableMask,
-        wfn = new PMPBase().write_cfg_vec(mask, addr, i)
+        wfn = new PMPBase().write_cfg_vec(mask, addr, i, cfgMerged(i/pmpCfgPerCSR))
       ))
     }).fold(Map())((a, b) => a ++ b) // ugly code, hit me if u have better codes
 
@@ -319,7 +342,6 @@ trait PMPMethod extends PMPConst {
   }
 }
 
-@chiselName
 class PMP(implicit p: Parameters) extends PMPXSModule with HasXSParameter with PMPMethod with PMAMethod with HasCSRConst {
   val io = IO(new Bundle {
     val distribute_csr = Flipped(new DistributedCSRIO())
@@ -348,13 +370,13 @@ class PMPReqBundle(lgMaxSize: Int = 3)(implicit p: Parameters) extends PMPBundle
   val size = Output(UInt(log2Ceil(lgMaxSize+1).W))
   val cmd = Output(TlbCmd())
 
-  def apply(addr: UInt, size: UInt, cmd: UInt) {
+  def apply(addr: UInt, size: UInt, cmd: UInt): Unit = {
     this.addr := addr
     this.size := size
     this.cmd := cmd
   }
 
-  def apply(addr: UInt) { // req minimal permission and req align size
+  def apply(addr: UInt): Unit = { // req minimal permission and req align size
     apply(addr, lgMaxSize.U, TlbCmd.read)
   }
 
@@ -365,6 +387,7 @@ class PMPRespBundle(implicit p: Parameters) extends PMPBundle {
   val st = Output(Bool())
   val instr = Output(Bool())
   val mmio = Output(Bool())
+  val atomic = Output(Bool())
 
   def |(resp: PMPRespBundle): PMPRespBundle = {
     val res = Wire(new PMPRespBundle())
@@ -372,6 +395,7 @@ class PMPRespBundle(implicit p: Parameters) extends PMPBundle {
     res.st := this.st || resp.st
     res.instr := this.instr || resp.instr
     res.mmio := this.mmio || resp.mmio
+    res.atomic := this.atomic || resp.atomic
     res
   }
 }
@@ -379,10 +403,11 @@ class PMPRespBundle(implicit p: Parameters) extends PMPBundle {
 trait PMPCheckMethod extends PMPConst {
   def pmp_check(cmd: UInt, cfg: PMPConfig) = {
     val resp = Wire(new PMPRespBundle)
-    resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAtom(cmd) && !cfg.r
-    resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAtom(cmd)) && !cfg.w
+    resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r
+    resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)) && !cfg.w
     resp.instr := TlbCmd.isExec(cmd) && !cfg.x
     resp.mmio := false.B
+    resp.atomic := false.B
     resp
   }
 
@@ -490,7 +515,6 @@ class PMPCheckv2IO(lgMaxSize: Int)(implicit p: Parameters) extends PMPBundle {
   }
 }
 
-@chiselName
 class PMPChecker
 (
   lgMaxSize: Int = 3,
@@ -521,7 +545,6 @@ class PMPChecker
 }
 
 /* get config with check */
-@chiselName
 class PMPCheckerv2
 (
   lgMaxSize: Int = 3,
