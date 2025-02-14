@@ -16,80 +16,111 @@
 
 package xiangshan.backend.rename.freelist
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import xiangshan._
+import xiangshan.backend.rename._
 import utils._
+import utility._
 
 
-class StdFreeList(size: Int)(implicit p: Parameters) extends BaseFreeList(size) with HasPerfEvents {
+class StdFreeList(freeListSize: Int, numLogicRegs: Int, regType: RegType, realNumLogicRegs: Int = 32)(implicit p: Parameters) extends BaseFreeList(freeListSize, realNumLogicRegs) with HasPerfEvents {
 
-  val freeList = RegInit(VecInit(Seq.tabulate(size)( i => (i + 32).U(PhyRegIdxWidth.W) )))
-  val headPtr  = RegInit(FreeListPtr(false.B, 0.U))
-  val tailPtr  = RegInit(FreeListPtr(true.B,  0.U))
+  val freeList = RegInit(VecInit(Seq.tabulate(freeListSize)( i => (i + numLogicRegs).U(PhyRegIdxWidth.W) )))
+  val lastTailPtr = RegInit(FreeListPtr(true, 0)) // tailPtr in the last cycle (need to add freeReqReg)
+  val tailPtr = Wire(new FreeListPtr) // this is the real tailPtr
+  val tailPtrOHReg = RegInit(0.U(freeListSize.W))
 
   //
   // free committed instructions' `old_pdest` reg
   //
-  for (i <- 0 until CommitWidth) {
-    val offset = if (i == 0) 0.U else PopCount(io.freeReq.take(i))
-    val ptr = tailPtr + offset
-    val idx = ptr.value
+  val freeReqReg = io.freeReq
+  for (i <- 0 until RabCommitWidth) {
+    val offset = if (i == 0) 0.U else PopCount(freeReqReg.take(i))
+    val enqPtr = lastTailPtr + offset
 
-    when (io.freeReq(i)) {
-      freeList(idx) := io.freePhyReg(i)
-      XSDebug(p"req#$i free physical reg: ${io.freePhyReg(i)}\n")
+    // Why RegNext (from RAT and Rename): for better timing
+    // Why we can RegNext: these free registers won't be used in the next cycle,
+    // since we set canAllocate only when the current free regs > RenameWidth.
+    when (freeReqReg(i)) {
+      freeList(enqPtr.value) := io.freePhyReg(i)
     }
+    XSDebug(io.freeReq(i), p"req#$i free physical reg: ${io.freePhyReg(i)}\n")
   }
 
-  val tailPtrNext = tailPtr + PopCount(io.freeReq)
-  tailPtr := tailPtrNext
+  tailPtr := lastTailPtr + PopCount(freeReqReg)
+  lastTailPtr := tailPtr
 
   //
   // allocate new physical registers for instructions at rename stage
   //
   val freeRegCnt = Wire(UInt()) // number of free registers in free list
-  io.canAllocate := RegNext(freeRegCnt >= RenameWidth.U) // use RegNext for better timing
+  io.canAllocate := GatedValidRegNext(freeRegCnt >= RenameWidth.U) // use RegNext for better timing
   XSDebug(p"freeRegCnt: $freeRegCnt\n")
 
-  val allocatePtr = (0 until RenameWidth).map(i => headPtr + i.U)
-  val phyRegCandidates = VecInit(allocatePtr.map(ptr => freeList(ptr.value)))
+  val phyRegCandidates = VecInit(headPtrOHVec.map(sel => Mux1H(sel, freeList)))
 
-  for(i <- 0 until RenameWidth){
-    io.allocatePhyReg(i) := phyRegCandidates(/* if (i == 0) 0.U else */PopCount(io.allocateReq.take(i)))
+  for(i <- 0 until RenameWidth) {
+    io.allocatePhyReg(i) := phyRegCandidates(PopCount(io.allocateReq.take(i)))
     XSDebug(p"req:${io.allocateReq(i)} canAllocate:${io.canAllocate} pdest:${io.allocatePhyReg(i)}\n")
   }
-  val headPtrAllocate = headPtr + PopCount(io.allocateReq)
-  val headPtrNext = Mux(io.canAllocate && io.doAllocate, headPtrAllocate, headPtr)
-  freeRegCnt := distanceBetween(tailPtr, headPtrNext)
+  val doCommit = io.commit.isCommit
+  val archAlloc = io.commit.commitValid zip io.commit.info map { case (valid, info) =>
+    valid && (regType match {
+      case Reg_F => info.fpWen
+      case Reg_V => info.vecWen
+      case Reg_V0 => info.v0Wen
+      case Reg_Vl => info.vlWen
+    })
+  }
+  val numArchAllocate = PopCount(archAlloc)
+  val archHeadPtrNew  = archHeadPtr + numArchAllocate
+  val archHeadPtrNext = Mux(doCommit, archHeadPtrNew, archHeadPtr)
+  archHeadPtr := archHeadPtrNext
+
+  val isWalkAlloc = io.walk && io.doAllocate
+  val isNormalAlloc = io.canAllocate && io.doAllocate
+  val isAllocate = isWalkAlloc || isNormalAlloc
+  val numAllocate = Mux(io.walk, PopCount(io.walkReq), PopCount(io.allocateReq))
+  val headPtrAllocate = Mux(lastCycleRedirect, redirectedHeadPtr, headPtr + numAllocate)
+  val headPtrOHAllocate = Mux(lastCycleRedirect, redirectedHeadPtrOH, headPtrOHVec(numAllocate))
+  val headPtrNext = Mux(isAllocate, headPtrAllocate, headPtr)
+  freeRegCnt := Mux(isWalkAlloc && !lastCycleRedirect, distanceBetween(tailPtr, headPtr) - PopCount(io.walkReq),
+                Mux(isNormalAlloc,                     distanceBetween(tailPtr, headPtr) - PopCount(io.allocateReq),
+                                                       distanceBetween(tailPtr, headPtr)))
 
   // priority: (1) exception and flushPipe; (2) walking; (3) mis-prediction; (4) normal dequeue
-  headPtr := Mux(io.walk,
-    headPtr - io.stepBack,
-    Mux(io.redirect, headPtr, headPtrNext))
+  val realDoAllocate = !io.redirect && isAllocate
+  headPtr := Mux(realDoAllocate, headPtrAllocate, headPtr)
+  headPtrOH := Mux(realDoAllocate, headPtrOHAllocate, headPtrOH)
 
   XSDebug(p"head:$headPtr tail:$tailPtr\n")
 
+  XSError(!isFull(tailPtr, archHeadPtr), s"${regType}ArchFreeList should always be full\n")
 
   val enableFreeListCheck = false
   if (enableFreeListCheck) {
-    for (i <- 0 until size) {
-      for (j <- i+1 until size) {
+    for (i <- 0 until freeListSize) {
+      for (j <- i+1 until freeListSize) {
         XSError(freeList(i) === freeList(j), s"Found same entry in free list! (i=$i j=$j)\n")
       }
     }
   }
 
-  XSPerfAccumulate("utilization", freeRegCnt)
-  XSPerfAccumulate("allocation_blocked", !io.canAllocate)
+  XSPerfAccumulate("utilization", PopCount(io.allocateReq))
+  XSPerfAccumulate("allocation_blocked_cycle", !io.canAllocate)
   XSPerfAccumulate("can_alloc_wrong", !io.canAllocate && freeRegCnt >= RenameWidth.U)
 
+  val freeRegCntReg = RegNext(freeRegCnt)
   val perfEvents = Seq(
-    ("std_freelist_1_4_valid", (freeRegCnt < (size / 4).U)                                   ),
-    ("std_freelist_2_4_valid", (freeRegCnt > (size / 4).U) & (freeRegCnt <= (size / 2).U)    ),
-    ("std_freelist_3_4_valid", (freeRegCnt > (size / 2).U) & (freeRegCnt <= (size * 3 / 4).U)),
-    ("std_freelist_4_4_valid", (freeRegCnt > (size * 3 / 4).U)                               )
+    ("std_freelist_1_4_valid", freeRegCntReg <  (freeListSize / 4).U                                            ),
+    ("std_freelist_2_4_valid", freeRegCntReg >= (freeListSize / 4).U && freeRegCntReg < (freeListSize / 2).U    ),
+    ("std_freelist_3_4_valid", freeRegCntReg >= (freeListSize / 2).U && freeRegCntReg < (freeListSize * 3 / 4).U),
+    ("std_freelist_4_4_valid", freeRegCntReg >= (freeListSize * 3 / 4).U                                        )
   )
+
+  QueuePerf(size = freeListSize, utilization = freeRegCntReg, full = freeRegCntReg === 0.U)
+
   generatePerfEvent()
 }

@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -16,11 +17,11 @@
 
 package xiangshan.cache
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import freechips.rocketchip.tilelink.{ClientMetadata, TLClientParameters, TLEdgeOut}
-import utils.{Code, ParallelOR, ReplacementPolicy, SRAMTemplate, XSDebug}
+import utility.{Code, ParallelOR, ReplacementPolicy, SRAMTemplate, XSDebug}
 
 import scala.math.max
 
@@ -41,7 +42,7 @@ class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
     })
   }
 
-  val waddr = (io.write.bits.addr >> blockOffBits).asUInt()
+  val waddr = (io.write.bits.addr >> blockOffBits).asUInt
   val raddrs = io.read.map(r => (r.bits.addr >> blockOffBits).asUInt)
   io.write.ready := (if (readHighPriority) {
     if (singlePort) {
@@ -63,8 +64,8 @@ class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
       val rdata = Output(UInt())
     })
 
-    val r_way_en_reg = RegNext(io.r_way_en)
-    val data_array = Array.fill(nWays) {
+    val r_way_en_reg = RegEnable(io.r_way_en, io.ren)
+    val data_array = Seq.fill(nWays) {
       Module(new SRAMTemplate(
         Bits(rowBits.W),
         set = nSets,
@@ -92,7 +93,7 @@ class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
     val data_left = Mux1H(r_way_en_reg.tail(half), data_read.take(half))
     val data_right = Mux1H(r_way_en_reg.head(half), data_read.drop(half))
 
-    val sel_low = r_way_en_reg.tail(half).orR()
+    val sel_low = r_way_en_reg.tail(half).orR
     val row_data = Mux(sel_low, data_left, data_right)
 
     io.rdata := row_data
@@ -108,8 +109,8 @@ class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
     io.read(j).ready := (if (readHighPriority) true.B else !rwhazard)
 
     // use way_en to select a way after data read out
-    assert(!(RegNext(io.read(j).fire() && PopCount(io.read(j).bits.way_en) > 1.U)))
-    val way_en = RegNext(io.read(j).bits.way_en)
+    assert(!(RegNext(io.read(j).fire && PopCount(io.read(j).bits.way_en) > 1.U)))
+    val way_en = RegEnable(io.read(j).bits.way_en, io.read(j).fire)
 
     val row_error = Wire(Vec(blockRows, Vec(rowWords, Bool())))
     for (r <- 0 until blockRows) {
@@ -127,9 +128,8 @@ class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
         data = getECCFromRow(io.write.bits.data(r)),
         waymask = io.write.bits.way_en
       )
-      when(ecc_array.io.w.req.valid) {
-        XSDebug(p"write in ecc sram ${j.U} row ${r.U}: setIdx=${Hexadecimal(ecc_array.io.w.req.bits.setIdx)} ecc(0)=${Hexadecimal(getECCFromRow(io.write.bits.data(r))(0))} ecc(1)=${Hexadecimal(getECCFromRow(io.write.bits.data(r))(1))} waymask=${Hexadecimal(io.write.bits.way_en)}\n")
-      }
+      XSDebug(ecc_array.io.w.req.valid,
+        p"write in ecc sram ${j.U} row ${r.U}: setIdx=${Hexadecimal(ecc_array.io.w.req.bits.setIdx)} ecc(0)=${Hexadecimal(getECCFromRow(io.write.bits.data(r))(0))} ecc(1)=${Hexadecimal(getECCFromRow(io.write.bits.data(r))(1))} waymask=${Hexadecimal(io.write.bits.way_en)}\n")
       ecc_array.io.r.req.valid := io.read(j).valid && rmask(r)
       ecc_array.io.r.req.bits.apply(setIdx = raddr)
 
@@ -154,15 +154,15 @@ class DuplicatedDataArray(implicit p: Parameters) extends AbstractDataArray {
       for (k <- 0 until rowWords) {
         ecc_resp_chosen(k) := Mux1H(way_en, ecc_resp(k))
       }
-      io.resp(j)(r) := Cat((0 until rowWords) reverseMap {
+      io.resp(j)(r) := Cat((0 until rowWords).reverseIterator.map {
         k => {
           val data = Cat(ecc_resp_chosen(k), data_resp_chosen(k))
           row_error(r)(k) := dcacheParameters.dataCode.decode(data).error && RegNext(rmask(r))
           data
         }
-      })
-      io.errors(j).report_to_beu := RegNext(io.read(j).fire()) && Cat(row_error.flatten).orR()
-      io.errors(j).paddr := RegNext(io.read(j).bits.addr)
+      }.toSeq)
+      io.errors(j).bits.report_to_beu := RegNext(io.read(j).fire) && Cat(row_error.flatten).orR
+      io.errors(j).bits.paddr := RegEnable(io.read(j).bits.addr, io.read(j).fire)
     }
 
     io.nacks(j) := false.B

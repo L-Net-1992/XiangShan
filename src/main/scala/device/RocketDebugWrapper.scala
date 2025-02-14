@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2021-2025 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2025 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -21,7 +22,7 @@ import xiangshan._
 import chisel3.experimental.{ExtModule, IntParam, noPrefix}
 import chisel3.util._
 import chisel3.util.HasExtModuleResource
-import freechips.rocketchip.config.{Field, Parameters}
+import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.amba.apb._
 import freechips.rocketchip.diplomacy._
@@ -48,17 +49,20 @@ class DebugModule(numCores: Int)(implicit p: Parameters) extends LazyModule {
 //  debug.dmInner.dmInner.sb2tlOpt.foreach { sb2tl  =>
 //    l2xbar := TLBuffer() := TLWidthWidget(1) := sb2tl.node
 //  }
+  class DebugModuleIO extends Bundle {
+    val resetCtrl = new ResetCtrlIO(numCores)(p)
+    val debugIO = new DebugIO()(p)
+    val clock = Input(Clock())
+    val reset = Input(Reset())
+  }
 
-  lazy val module = new LazyRawModuleImp(this) {
-    val io = IO(new Bundle{
-      val resetCtrl = new ResetCtrlIO(numCores)(p)
-      val debugIO = new DebugIO()(p)
-      val clock = Input(Bool())
-      val reset = Input(Bool())
-    })
+  class DebugModuleImp(wrapper: LazyModule) extends LazyRawModuleImp(wrapper) {
+    val io = IO(new DebugModuleIO)
     debug.module.io.tl_reset := io.reset // this should be TL reset
-    debug.module.io.tl_clock := io.clock.asClock // this should be TL clock
-    debug.module.io.hartIsInReset := io.resetCtrl.hartIsInReset
+    debug.module.io.tl_clock := io.clock // this should be TL clock
+    withClock(io.clock) {
+      debug.module.io.hartIsInReset := RegNext(io.resetCtrl.hartIsInReset)
+    }
     io.resetCtrl.hartResetReq.foreach { rcio => debug.module.io.hartResetReq.foreach { rcdm => rcio := rcdm }}
 
     io.debugIO.clockeddmi.foreach { dbg => debug.module.io.dmi.get <> dbg } // not connected in current case since we use dtm
@@ -91,19 +95,8 @@ class DebugModule(numCores: Int)(implicit p: Parameters) extends LazyModule {
       dtm
     }
   }
-}
 
-object XSDebugModuleParams {
-
-  def apply(xlen:Int /*TODO , val configStringAddr: Int*/): DebugModuleParams = {
-    new DebugModuleParams().copy(
-      nAbstractDataWords   = (if (xlen == 32) 1 else if (xlen == 64) 2 else 4),
-      maxSupportedSBAccess = xlen,
-      hasBusMaster = true,
-      baseAddress = BigInt(0x38020000),
-      nScratch = 2
-    )
-  }
+  lazy val module = new DebugModuleImp(this)
 }
 
 case object EnableJtag extends Field[Bool]
@@ -112,13 +105,16 @@ class SimJTAG(tickDelay: Int = 50)(implicit val p: Parameters) extends ExtModule
   with HasExtModuleResource {
 
   val clock = IO(Input(Clock()))
-  val reset = IO(Input(Bool()))
+  val reset = IO(Input(Reset()))
   val jtag = IO(new JTAGIO(hasTRSTn = true))
   val enable = IO(Input(Bool()))
   val init_done = IO(Input(Bool()))
   val exit = IO(Output(UInt(32.W)))
 
-  def connect(dutio: JTAGIO, tbclock: Clock, tbreset: Bool, done: Bool, tbsuccess: Bool) = {
+  def connect(dutio: JTAGIO, tbclock: Clock, tbreset: Reset, done: Bool, tbsuccess: Bool) = {
+    if (!dutio.TRSTn.isEmpty) {
+      dutio.TRSTn.get := jtag.TRSTn.getOrElse(false.B) || !tbreset.asBool
+    }
     dutio.TCK := jtag.TCK
     dutio.TMS := jtag.TMS
     dutio.TDI := jtag.TDI
@@ -135,7 +131,7 @@ class SimJTAG(tickDelay: Int = 50)(implicit val p: Parameters) extends ExtModule
     tbsuccess := exit === 1.U
     when (exit >= 2.U) {
       printf("*** FAILED *** (exit code = %d)\n", exit >> 1.U)
-      stop(1)
+      stop()
     }
   }
 }

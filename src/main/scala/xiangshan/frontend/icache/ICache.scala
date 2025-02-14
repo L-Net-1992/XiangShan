@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -12,563 +13,704 @@
 * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 *
 * See the Mulan PSL v2 for more details.
+*
+*
+* Acknowledgement
+*
+* This implementation is inspired by several key papers:
+* [1] Glenn Reinman, Brad Calder, and Todd Austin. "[Fetch directed instruction prefetching.]
+* (https://doi.org/10.1109/MICRO.1999.809439)" 32nd Annual ACM/IEEE International Symposium on Microarchitecture
+* (MICRO). 1999.
 ***************************************************************************************/
 
-package  xiangshan.frontend.icache
+package xiangshan.frontend.icache
 
-import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.diplomacy.{IdRange, LazyModule, LazyModuleImp, TransferSizes}
+import freechips.rocketchip.diplomacy.AddressSet
+import freechips.rocketchip.diplomacy.IdRange
+import freechips.rocketchip.diplomacy.LazyModule
+import freechips.rocketchip.diplomacy.LazyModuleImp
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.BundleFieldBase
-import huancun.{AliasField, DirtyField, PreferCacheField, PrefetchField}
-import xiangshan._
-import xiangshan.frontend._
-import xiangshan.cache._
+import huancun.AliasField
+import huancun.PrefetchField
+import org.chipsalliance.cde.config.Parameters
+import utility._
 import utils._
-import xiangshan.backend.fu.PMPReqBundle
-import xiangshan.cache.mmu.{BlockTlbRequestIO, TlbReq}
+import xiangshan._
+import xiangshan.cache._
+import xiangshan.cache.mmu.TlbRequestIO
+import xiangshan.frontend._
 
 case class ICacheParameters(
-    nSets: Int = 256,
-    nWays: Int = 8,
-    rowBits: Int = 64,
-    nTLBEntries: Int = 32,
-    tagECC: Option[String] = None,
-    dataECC: Option[String] = None,
-    replacer: Option[String] = Some("random"),
-    nMissEntries: Int = 2,
-    nReleaseEntries: Int = 1,
-    nProbeEntries: Int = 2,
-    nPrefetchEntries: Int = 4,
-    hasPrefetch: Boolean = false,
-    nMMIOs: Int = 1,
-    blockBytes: Int = 64
-)extends L1CacheParameters {
+    nSets:               Int = 256,
+    nWays:               Int = 4,
+    rowBits:             Int = 64,
+    nTLBEntries:         Int = 32,
+    tagECC:              Option[String] = None,
+    dataECC:             Option[String] = None,
+    replacer:            Option[String] = Some("random"),
+    PortNumber:          Int = 2,
+    nFetchMshr:          Int = 4,
+    nPrefetchMshr:       Int = 10,
+    nWayLookupSize:      Int = 32,
+    DataCodeUnit:        Int = 64,
+    ICacheDataBanks:     Int = 8,
+    ICacheDataSRAMWidth: Int = 66,
+    // TODO: hard code, need delete
+    partWayNum:          Int = 4,
+    nMMIOs:              Int = 1,
+    blockBytes:          Int = 64,
+    cacheCtrlAddressOpt: Option[AddressSet] = None
+) extends L1CacheParameters {
 
-  val setBytes = nSets * blockBytes
-  val aliasBitsOpt = if(setBytes > pageSize) Some(log2Ceil(setBytes / pageSize)) else None
+  val setBytes:     Int         = nSets * blockBytes
+  val aliasBitsOpt: Option[Int] = Option.when(setBytes > pageSize)(log2Ceil(setBytes / pageSize))
   val reqFields: Seq[BundleFieldBase] = Seq(
     PrefetchField(),
-    PreferCacheField()
+    ReqSourceField()
   ) ++ aliasBitsOpt.map(AliasField)
-  val echoFields: Seq[BundleFieldBase] = Seq(DirtyField())
-  def tagCode: Code = Code.fromString(tagECC)
-  def dataCode: Code = Code.fromString(dataECC)
-  def replacement = ReplacementPolicy.fromString(replacer,nWays,nSets)
+  val echoFields: Seq[BundleFieldBase] = Nil
+  def tagCode:    Code                 = Code.fromString(tagECC)
+  def dataCode:   Code                 = Code.fromString(dataECC)
+  def replacement = ReplacementPolicy.fromString(replacer, nWays, nSets)
 }
 
-trait HasICacheParameters extends HasL1CacheParameters with HasInstrMMIOConst with HasIFUConst{
-  val cacheParams = icacheParameters
-  val dataCodeUnit = 16
-  val dataCodeUnitNum  = blockBits/dataCodeUnit
+trait HasICacheParameters extends HasL1CacheParameters with HasInstrMMIOConst with HasIFUConst {
+  val cacheParams: ICacheParameters = icacheParameters
 
-  def highestIdxBit = log2Ceil(nSets) - 1
-  def encDataUnitBits   = cacheParams.dataCode.width(dataCodeUnit)
-  def dataCodeBits      = encDataUnitBits - dataCodeUnit
-  def dataCodeEntryBits = dataCodeBits * dataCodeUnitNum
+  def ctrlUnitParamsOpt: Option[L1ICacheCtrlParams] = OptionWrapper(
+    cacheParams.cacheCtrlAddressOpt.nonEmpty,
+    L1ICacheCtrlParams(
+      address = cacheParams.cacheCtrlAddressOpt.get,
+      regWidth = XLEN
+    )
+  )
 
-  val ICacheSets = cacheParams.nSets
-  val ICacheWays = cacheParams.nWays
+  def ICacheSets:          Int = cacheParams.nSets
+  def ICacheWays:          Int = cacheParams.nWays
+  def PortNumber:          Int = cacheParams.PortNumber
+  def nFetchMshr:          Int = cacheParams.nFetchMshr
+  def nPrefetchMshr:       Int = cacheParams.nPrefetchMshr
+  def nWayLookupSize:      Int = cacheParams.nWayLookupSize
+  def DataCodeUnit:        Int = cacheParams.DataCodeUnit
+  def ICacheDataBanks:     Int = cacheParams.ICacheDataBanks
+  def ICacheDataSRAMWidth: Int = cacheParams.ICacheDataSRAMWidth
+  def partWayNum:          Int = cacheParams.partWayNum
 
-  val ICacheSameVPAddrLength = 12
-  val ReplaceIdWid = 5
+  def ICacheMetaBits:      Int = tagBits // FIXME: unportable: maybe use somemethod to get width
+  def ICacheMetaCodeBits:  Int = 1       // FIXME: unportable: maybe use cacheParams.tagCode.somemethod to get width
+  def ICacheMetaEntryBits: Int = ICacheMetaBits + ICacheMetaCodeBits
 
-  val ICacheWordOffset = 0
-  val ICacheSetOffset = ICacheWordOffset + log2Up(blockBytes)
-  val ICacheAboveIndexOffset = ICacheSetOffset + log2Up(ICacheSets)
-  val ICacheTagOffset = ICacheAboveIndexOffset min ICacheSameVPAddrLength
+  def ICacheDataBits: Int = blockBits / ICacheDataBanks
+  def ICacheDataCodeSegs: Int =
+    math.ceil(ICacheDataBits / DataCodeUnit).toInt // split data to segments for ECC checking
+  def ICacheDataCodeBits: Int =
+    ICacheDataCodeSegs * 1 // FIXME: unportable: maybe use cacheParams.dataCode.somemethod to get width
+  def ICacheDataEntryBits: Int = ICacheDataBits + ICacheDataCodeBits
+  def ICacheBankVisitNum:  Int = 32 * 8 / ICacheDataBits + 1
+  def highestIdxBit:       Int = log2Ceil(nSets) - 1
 
-  def ReplacePipeKey = 0
-  def MainPipeKey = 1
-  def PortNumber = 2
-  def ProbeKey   = 3
-
-  def nPrefetchEntries = cacheParams.nPrefetchEntries
+  require((ICacheDataBanks >= 2) && isPow2(ICacheDataBanks))
+  require(ICacheDataSRAMWidth >= ICacheDataEntryBits)
+  require(isPow2(ICacheSets), s"nSets($ICacheSets) must be pow2")
+  require(isPow2(ICacheWays), s"nWays($ICacheWays) must be pow2")
 
   def generatePipeControl(lastFire: Bool, thisFire: Bool, thisFlush: Bool, lastFlush: Bool): Bool = {
-    val valid  = RegInit(false.B)
-    when(thisFlush)                    {valid  := false.B}
-      .elsewhen(lastFire && !lastFlush)  {valid  := true.B}
-      .elsewhen(thisFire)                 {valid  := false.B}
+    val valid = RegInit(false.B)
+    when(thisFlush)(valid := false.B)
+      .elsewhen(lastFire && !lastFlush)(valid := true.B)
+      .elsewhen(thisFire)(valid := false.B)
     valid
   }
 
-  def ResultHoldBypass[T<:Data](data: T, valid: Bool): T = {
+  def ResultHoldBypass[T <: Data](data: T, valid: Bool): T =
     Mux(valid, data, RegEnable(data, valid))
+
+  def ResultHoldBypass[T <: Data](data: T, init: T, valid: Bool): T =
+    Mux(valid, data, RegEnable(data, init, valid))
+
+  def holdReleaseLatch(valid: Bool, release: Bool, flush: Bool): Bool = {
+    val bit = RegInit(false.B)
+    when(flush)(bit := false.B)
+      .elsewhen(valid && !release)(bit := true.B)
+      .elsewhen(release)(bit := false.B)
+    bit || valid
   }
 
-  require(isPow2(nSets), s"nSets($nSets) must be pow2")
-  require(isPow2(nWays), s"nWays($nWays) must be pow2")
+  def blockCounter(block: Bool, flush: Bool, threshold: Int): Bool = {
+    val counter = RegInit(0.U(log2Up(threshold + 1).W))
+    when(block)(counter := counter + 1.U)
+    when(flush)(counter := 0.U)
+    counter > threshold.U
+  }
+
+  def InitQueue[T <: Data](entry: T, size: Int): Vec[T] =
+    RegInit(VecInit(Seq.fill(size)(0.U.asTypeOf(entry.cloneType))))
+
+  def getBankSel(blkOffset: UInt, valid: Bool = true.B): Vec[UInt] = {
+    val bankIdxLow  = (Cat(0.U(1.W), blkOffset) >> log2Ceil(blockBytes / ICacheDataBanks)).asUInt
+    val bankIdxHigh = ((Cat(0.U(1.W), blkOffset) + 32.U) >> log2Ceil(blockBytes / ICacheDataBanks)).asUInt
+    val bankSel     = VecInit((0 until ICacheDataBanks * 2).map(i => (i.U >= bankIdxLow) && (i.U <= bankIdxHigh)))
+    assert(
+      !valid || PopCount(bankSel) === ICacheBankVisitNum.U,
+      "The number of bank visits must be %d, but bankSel=0x%x",
+      ICacheBankVisitNum.U,
+      bankSel.asUInt
+    )
+    bankSel.asTypeOf(UInt((ICacheDataBanks * 2).W)).asTypeOf(Vec(2, UInt(ICacheDataBanks.W)))
+  }
+
+  def getLineSel(blkOffset: UInt): Vec[Bool] = {
+    val bankIdxLow = (blkOffset >> log2Ceil(blockBytes / ICacheDataBanks)).asUInt
+    val lineSel    = VecInit((0 until ICacheDataBanks).map(i => i.U < bankIdxLow))
+    lineSel
+  }
+
+  def getBlkAddr(addr:        UInt): UInt = (addr >> blockOffBits).asUInt
+  def getPhyTagFromBlk(addr:  UInt): UInt = (addr >> (pgUntagBits - blockOffBits)).asUInt
+  def getIdxFromBlk(addr:     UInt): UInt = addr(idxBits - 1, 0)
+  def getPaddrFromPtag(vaddr: UInt, ptag: UInt): UInt = Cat(ptag, vaddr(pgUntagBits - 1, 0))
+  def getPaddrFromPtag(vaddrVec: Vec[UInt], ptagVec: Vec[UInt]): Vec[UInt] =
+    VecInit((vaddrVec zip ptagVec).map { case (vaddr, ptag) => getPaddrFromPtag(vaddr, ptag) })
+}
+
+trait HasICacheECCHelper extends HasICacheParameters {
+  def encodeMetaECC(meta: UInt, poison: Bool = false.B): UInt = {
+    require(meta.getWidth == ICacheMetaBits)
+    val code = cacheParams.tagCode.encode(meta, poison) >> ICacheMetaBits
+    code.asTypeOf(UInt(ICacheMetaCodeBits.W))
+  }
+
+  def encodeDataECC(data: UInt, poison: Bool = false.B): UInt = {
+    require(data.getWidth == ICacheDataBits)
+    val datas = data.asTypeOf(Vec(ICacheDataCodeSegs, UInt((ICacheDataBits / ICacheDataCodeSegs).W)))
+    val codes = VecInit(datas.map(cacheParams.dataCode.encode(_, poison) >> (ICacheDataBits / ICacheDataCodeSegs)))
+    codes.asTypeOf(UInt(ICacheDataCodeBits.W))
+  }
 }
 
 abstract class ICacheBundle(implicit p: Parameters) extends XSBundle
-  with HasICacheParameters
+    with HasICacheParameters
 
 abstract class ICacheModule(implicit p: Parameters) extends XSModule
-  with HasICacheParameters
+    with HasICacheParameters
 
 abstract class ICacheArray(implicit p: Parameters) extends XSModule
-  with HasICacheParameters
+    with HasICacheParameters
 
 class ICacheMetadata(implicit p: Parameters) extends ICacheBundle {
-  val coh = new ClientMetadata
-  val tag = UInt(tagBits.W)
+  val tag: UInt = UInt(tagBits.W)
 }
 
 object ICacheMetadata {
-  def apply(tag: Bits, coh: ClientMetadata)(implicit p: Parameters) = {
-    val meta = Wire(new L1Metadata)
+  def apply(tag: Bits)(implicit p: Parameters): ICacheMetadata = {
+    val meta = Wire(new ICacheMetadata)
     meta.tag := tag
-    meta.coh := coh
     meta
   }
 }
 
+class ICacheMetaArrayIO(implicit p: Parameters) extends ICacheBundle {
+  val write:    DecoupledIO[ICacheMetaWriteBundle] = Flipped(DecoupledIO(new ICacheMetaWriteBundle))
+  val read:     DecoupledIO[ICacheReadBundle]      = Flipped(DecoupledIO(new ICacheReadBundle))
+  val readResp: ICacheMetaRespBundle               = Output(new ICacheMetaRespBundle)
+  val flush:    Vec[Valid[ICacheMetaFlushBundle]]  = Vec(PortNumber, Flipped(ValidIO(new ICacheMetaFlushBundle)))
+  val flushAll: Bool                               = Input(Bool())
+}
 
-class ICacheMetaArray()(implicit p: Parameters) extends ICacheArray
-{
-  def onReset = ICacheMetadata(0.U, ClientMetadata.onReset)
-  val metaBits = onReset.getWidth
-  val metaEntryBits = cacheParams.tagCode.width(metaBits)
+class ICacheMetaArray(implicit p: Parameters) extends ICacheArray with HasICacheECCHelper {
+  class ICacheMetaEntry(implicit p: Parameters) extends ICacheBundle {
+    val meta: ICacheMetadata = new ICacheMetadata
+    val code: UInt           = UInt(ICacheMetaCodeBits.W)
+  }
 
-  val io=IO{new Bundle{
-    val write    = Flipped(DecoupledIO(new ICacheMetaWriteBundle))
-    val read     = Flipped(DecoupledIO(new ICacheReadBundle))
-    val readResp = Output(new ICacheMetaRespBundle)
-    val cacheOp  = Flipped(new L1CacheInnerOpIO) // customized cache op port 
-  }}
+  private object ICacheMetaEntry {
+    def apply(meta: ICacheMetadata, poison: Bool)(implicit p: Parameters): ICacheMetaEntry = {
+      val entry = Wire(new ICacheMetaEntry)
+      entry.meta := meta
+      entry.code := encodeMetaECC(meta.asUInt, poison)
+      entry
+    }
+  }
 
-  io.read.ready := !io.write.valid
+  // sanity check
+  require(ICacheMetaEntryBits == (new ICacheMetaEntry).getWidth)
 
-  val port_0_read_0 = io.read.valid  && !io.read.bits.vSetIdx(0)(0)
-  val port_0_read_1 = io.read.valid  &&  io.read.bits.vSetIdx(0)(0)
-  val port_1_read_1  = io.read.valid &&  io.read.bits.vSetIdx(1)(0) && io.read.bits.isDoubleLine
-  val port_1_read_0  = io.read.valid && !io.read.bits.vSetIdx(1)(0) && io.read.bits.isDoubleLine
+  val io: ICacheMetaArrayIO = IO(new ICacheMetaArrayIO)
 
-  val port_0_read_0_reg = RegEnable(port_0_read_0, io.read.fire())
-  val port_0_read_1_reg = RegEnable(port_0_read_1, io.read.fire())
-  val port_1_read_1_reg = RegEnable(port_1_read_1, io.read.fire())
-  val port_1_read_0_reg = RegEnable(port_1_read_0, io.read.fire())
+  private val port_0_read_0 = io.read.valid && !io.read.bits.vSetIdx(0)(0)
+  private val port_0_read_1 = io.read.valid && io.read.bits.vSetIdx(0)(0)
+  private val port_1_read_1 = io.read.valid && io.read.bits.vSetIdx(1)(0) && io.read.bits.isDoubleLine
+  private val port_1_read_0 = io.read.valid && !io.read.bits.vSetIdx(1)(0) && io.read.bits.isDoubleLine
 
-  val bank_0_idx = Mux(port_0_read_0, io.read.bits.vSetIdx(0), io.read.bits.vSetIdx(1))
-  val bank_1_idx = Mux(port_0_read_1, io.read.bits.vSetIdx(0), io.read.bits.vSetIdx(1))
-  val bank_idx   = Seq(bank_0_idx, bank_1_idx)
+  private val port_0_read_0_reg = RegEnable(port_0_read_0, 0.U.asTypeOf(port_0_read_0), io.read.fire)
+  private val port_0_read_1_reg = RegEnable(port_0_read_1, 0.U.asTypeOf(port_0_read_1), io.read.fire)
+  private val port_1_read_1_reg = RegEnable(port_1_read_1, 0.U.asTypeOf(port_1_read_1), io.read.fire)
+  private val port_1_read_0_reg = RegEnable(port_1_read_0, 0.U.asTypeOf(port_1_read_0), io.read.fire)
 
-  val write_bank_0 = io.write.valid && !io.write.bits.bankIdx
-  val write_bank_1 = io.write.valid &&  io.write.bits.bankIdx
+  private val bank_0_idx = Mux(port_0_read_0, io.read.bits.vSetIdx(0), io.read.bits.vSetIdx(1))
+  private val bank_1_idx = Mux(port_0_read_1, io.read.bits.vSetIdx(0), io.read.bits.vSetIdx(1))
 
-  val write_meta_bits = Wire(UInt(metaEntryBits.W))
+  private val write_bank_0 = io.write.valid && !io.write.bits.bankIdx
+  private val write_bank_1 = io.write.valid && io.write.bits.bankIdx
 
-  val tagArrays = (0 until 2) map { bank =>
+  private val write_meta_bits = ICacheMetaEntry(
+    meta = ICacheMetadata(
+      tag = io.write.bits.phyTag
+    ),
+    poison = io.write.bits.poison
+  )
+
+  private val tagArrays = (0 until PortNumber) map { bank =>
     val tagArray = Module(new SRAMTemplate(
-      UInt(metaEntryBits.W),
-      set=nSets/2,
-      way=nWays,
+      new ICacheMetaEntry(),
+      set = nSets / PortNumber,
+      way = nWays,
       shouldReset = true,
       holdRead = true,
-      singlePort = true
+      singlePort = true,
+      withClockGate = false // enable signal timing is bad, no gating here
     ))
 
-    //meta connection
-    if(bank == 0) {
+    // meta connection
+    if (bank == 0) {
       tagArray.io.r.req.valid := port_0_read_0 || port_1_read_0
-      tagArray.io.r.req.bits.apply(setIdx=bank_0_idx(highestIdxBit,1))
+      tagArray.io.r.req.bits.apply(setIdx = bank_0_idx(highestIdxBit, 1))
       tagArray.io.w.req.valid := write_bank_0
-      tagArray.io.w.req.bits.apply(data=write_meta_bits, setIdx=io.write.bits.virIdx(highestIdxBit,1), waymask=io.write.bits.waymask)
-    }
-    else {
+      tagArray.io.w.req.bits.apply(
+        data = write_meta_bits,
+        setIdx = io.write.bits.virIdx(highestIdxBit, 1),
+        waymask = io.write.bits.waymask
+      )
+    } else {
       tagArray.io.r.req.valid := port_0_read_1 || port_1_read_1
-      tagArray.io.r.req.bits.apply(setIdx=bank_1_idx(highestIdxBit,1))
+      tagArray.io.r.req.bits.apply(setIdx = bank_1_idx(highestIdxBit, 1))
       tagArray.io.w.req.valid := write_bank_1
-      tagArray.io.w.req.bits.apply(data=write_meta_bits, setIdx=io.write.bits.virIdx(highestIdxBit,1), waymask=io.write.bits.waymask)
+      tagArray.io.w.req.bits.apply(
+        data = write_meta_bits,
+        setIdx = io.write.bits.virIdx(highestIdxBit, 1),
+        waymask = io.write.bits.waymask
+      )
     }
 
     tagArray
   }
 
-  //Parity Decode
-  val read_metas = Wire(Vec(2,Vec(nWays,new ICacheMetadata())))
-  for((tagArray,i) <- tagArrays.zipWithIndex){
-    val read_meta_bits = tagArray.io.r.resp.asTypeOf(Vec(nWays,UInt(metaEntryBits.W)))
-    val read_meta_decoded = read_meta_bits.map{ way_bits => cacheParams.tagCode.decode(way_bits)}
-    val read_meta_wrong = read_meta_decoded.map{ way_bits_decoded => way_bits_decoded.error}
-    val read_meta_corrected = VecInit(read_meta_decoded.map{ way_bits_decoded => way_bits_decoded.corrected})
-    read_metas(i) := read_meta_corrected.asTypeOf(Vec(nWays,new ICacheMetadata()))
-    (0 until nWays).map{ w => io.readResp.errors(i)(w) := RegNext(read_meta_wrong(w)) && RegNext(RegNext(io.read.fire))}
+  private val read_set_idx_next = RegEnable(io.read.bits.vSetIdx, 0.U.asTypeOf(io.read.bits.vSetIdx), io.read.fire)
+  private val valid_array       = RegInit(VecInit(Seq.fill(nWays)(0.U(nSets.W))))
+  private val valid_metas       = Wire(Vec(PortNumber, Vec(nWays, Bool())))
+  // valid read
+  (0 until PortNumber).foreach(i =>
+    (0 until nWays).foreach(way =>
+      valid_metas(i)(way) := valid_array(way)(read_set_idx_next(i))
+    )
+  )
+  io.readResp.entryValid := valid_metas
+
+  io.read.ready := !io.write.valid && !io.flush.map(_.valid).reduce(_ || _) && !io.flushAll &&
+    tagArrays.map(_.io.r.req.ready).reduce(_ && _)
+
+  // valid write
+  private val way_num = OHToUInt(io.write.bits.waymask)
+  when(io.write.valid) {
+    valid_array(way_num) := valid_array(way_num).bitSet(io.write.bits.virIdx, true.B)
   }
 
-  //Parity Encode
-  val write = io.write.bits
-  write_meta_bits := cacheParams.tagCode.encode(ICacheMetadata(tag = write.phyTag, coh = write.coh).asUInt)
+  XSPerfAccumulate("meta_refill_num", io.write.valid)
 
-  val wayNum   = OHToUInt(io.write.bits.waymask)
-  val validPtr = Cat(io.write.bits.virIdx, wayNum)
+  io.readResp.metas <> DontCare
+  io.readResp.codes <> DontCare
+  private val readMetaEntries = tagArrays.map(port => port.io.r.resp.asTypeOf(Vec(nWays, new ICacheMetaEntry())))
+  private val readMetas       = readMetaEntries.map(_.map(_.meta))
+  private val readCodes       = readMetaEntries.map(_.map(_.code))
 
-  io.readResp.metaData <> DontCare
-  when(port_0_read_0_reg){
-    io.readResp.metaData(0) := read_metas(0)
-  }.elsewhen(port_0_read_1_reg){
-    io.readResp.metaData(0) := read_metas(1)
+  // TEST: force ECC to fail by setting readCodes to 0
+  if (ICacheForceMetaECCError) {
+    readCodes.foreach(_.foreach(_ := 0.U))
   }
 
-  when(port_1_read_0_reg){
-    io.readResp.metaData(1) := read_metas(0)
-  }.elsewhen(port_1_read_1_reg){
-    io.readResp.metaData(1) := read_metas(1)
+  when(port_0_read_0_reg) {
+    io.readResp.metas(0) := readMetas(0)
+    io.readResp.codes(0) := readCodes(0)
+  }.elsewhen(port_0_read_1_reg) {
+    io.readResp.metas(0) := readMetas(1)
+    io.readResp.codes(0) := readCodes(1)
   }
 
+  when(port_1_read_0_reg) {
+    io.readResp.metas(1) := readMetas(0)
+    io.readResp.codes(1) := readCodes(0)
+  }.elsewhen(port_1_read_1_reg) {
+    io.readResp.metas(1) := readMetas(1)
+    io.readResp.codes(1) := readCodes(1)
+  }
 
-  io.write.ready := true.B
-  // deal with customized cache op
-  require(nWays <= 32)
-  io.cacheOp.resp.bits := DontCare
-  val cacheOpShouldResp = WireInit(false.B) 
-  when(io.cacheOp.req.valid){
-    when(
-      CacheInstrucion.isReadTag(io.cacheOp.req.bits.opCode) ||
-      CacheInstrucion.isReadTagECC(io.cacheOp.req.bits.opCode)
-    ){
-      for (i <- 0 until 2) {
-        tagArrays(i).io.r.req.valid := true.B
-        tagArrays(i).io.r.req.bits.apply(setIdx = io.cacheOp.req.bits.index)
-      }
-      cacheOpShouldResp := true.B
-    }
-    when(CacheInstrucion.isWriteTag(io.cacheOp.req.bits.opCode)){
-      for (i <- 0 until 2) {
-        tagArrays(i).io.w.req.valid := true.B
-        tagArrays(i).io.w.req.bits.apply(
-          data = io.cacheOp.req.bits.write_tag_low, 
-          setIdx = io.cacheOp.req.bits.index, 
-          waymask = UIntToOH(io.cacheOp.req.bits.wayNum(4, 0))
+  io.write.ready := true.B // TODO : has bug ? should be !io.cacheOp.req.valid
+
+  /*
+   * flush logic
+   */
+  // flush standalone set (e.g. flushed by mainPipe before doing re-fetch)
+  when(io.flush.map(_.valid).reduce(_ || _)) {
+    (0 until nWays).foreach { w =>
+      valid_array(w) := (0 until PortNumber).map { i =>
+        Mux(
+          // check if set `virIdx` in way `w` is requested to be flushed by port `i`
+          io.flush(i).valid && io.flush(i).bits.waymask(w),
+          valid_array(w).bitSet(io.flush(i).bits.virIdx, false.B),
+          valid_array(w)
         )
-      }
-      cacheOpShouldResp := true.B
+      }.reduce(_ & _)
     }
-    // TODO
-    // when(CacheInstrucion.isWriteTagECC(io.cacheOp.req.bits.opCode)){
-    //   for (i <- 0 until readPorts) {
-    //     array(i).io.ecc_write.valid := true.B
-    //     array(i).io.ecc_write.bits.idx := io.cacheOp.req.bits.index
-    //     array(i).io.ecc_write.bits.way_en := UIntToOH(io.cacheOp.req.bits.wayNum(4, 0))
-    //     array(i).io.ecc_write.bits.ecc := io.cacheOp.req.bits.write_tag_ecc
-    //   }
-    //   cacheOpShouldResp := true.B
-    // }
   }
-  io.cacheOp.resp.valid := RegNext(io.cacheOp.req.valid && cacheOpShouldResp)
-  io.cacheOp.resp.bits.read_tag_low := Mux(io.cacheOp.resp.valid, 
-    tagArrays(0).io.r.resp.asTypeOf(Vec(nWays, UInt(tagBits.W)))(io.cacheOp.req.bits.wayNum),
-    0.U
-  )
-  io.cacheOp.resp.bits.read_tag_ecc := DontCare // TODO
-  // TODO: deal with duplicated array
+
+  // flush all (e.g. fence.i)
+  when(io.flushAll) {
+    (0 until nWays).foreach(w => valid_array(w) := 0.U)
+  }
+
+  // PERF: flush counter
+  XSPerfAccumulate("flush", io.flush.map(_.valid).reduce(_ || _))
+  XSPerfAccumulate("flush_all", io.flushAll)
 }
 
-
-class ICacheDataArray(implicit p: Parameters) extends ICacheArray
-{
-
-  def getECCFromEncUnit(encUnit: UInt) = {
-    require(encUnit.getWidth == encDataUnitBits)
-    encUnit(encDataUnitBits - 1, dataCodeUnit)
-  }
-
-  def getECCFromBlock(cacheblock: UInt) = {
-    // require(cacheblock.getWidth == blockBits)
-    VecInit((0 until dataCodeUnitNum).map { w =>
-      val unit = cacheblock(dataCodeUnit * (w + 1) - 1, dataCodeUnit * w)
-      getECCFromEncUnit(cacheParams.dataCode.encode(unit))
-    })
-  }
-
-  val io=IO{new Bundle{
-    val write    = Flipped(DecoupledIO(new ICacheDataWriteBundle))
-    val read     = Flipped(DecoupledIO(new ICacheReadBundle))
-    val readResp = Output(new ICacheDataRespBundle)
-    val cacheOp  = Flipped(new L1CacheInnerOpIO) // customized cache op port 
-  }}
-
-  io.read.ready := !io.write.valid
-
-  val port_0_read_0 = io.read.valid  && !io.read.bits.vSetIdx(0)(0)
-  val port_0_read_1 = io.read.valid  &&  io.read.bits.vSetIdx(0)(0)
-  val port_1_read_1  = io.read.valid &&  io.read.bits.vSetIdx(1)(0) && io.read.bits.isDoubleLine
-  val port_1_read_0  = io.read.valid && !io.read.bits.vSetIdx(1)(0) && io.read.bits.isDoubleLine
-
-  val port_0_read_1_reg = RegEnable(port_0_read_1, io.read.fire())
-  val port_1_read_0_reg = RegEnable(port_1_read_0, io.read.fire())
-
-  val bank_0_idx = Mux(port_0_read_0, io.read.bits.vSetIdx(0), io.read.bits.vSetIdx(1))
-  val bank_1_idx = Mux(port_0_read_1, io.read.bits.vSetIdx(0), io.read.bits.vSetIdx(1))
-  val bank_idx   = Seq(bank_0_idx, bank_1_idx)
-
-  val write_bank_0 = WireInit(io.write.valid && !io.write.bits.bankIdx)
-  val write_bank_1 = WireInit(io.write.valid &&  io.write.bits.bankIdx)
-
-  val write_data_bits = Wire(UInt(blockBits.W))
-  val write_data_code = Wire(UInt(dataCodeEntryBits.W))
-
-  val dataArrays = (0 until 2) map { i =>
-    val dataArray = Module(new SRAMTemplate(
-      UInt(blockBits.W),
-      set=nSets/2,
-      way=nWays,
-      shouldReset = true,
-      holdRead = true,
-      singlePort = true
-    ))
-
-    if(i == 0) {
-      dataArray.io.r.req.valid := port_0_read_0 || port_1_read_0
-      dataArray.io.r.req.bits.apply(setIdx=bank_0_idx(highestIdxBit,1))
-      dataArray.io.w.req.valid := write_bank_0
-      dataArray.io.w.req.bits.apply(data=write_data_bits, setIdx=io.write.bits.virIdx(highestIdxBit,1), waymask=io.write.bits.waymask)
-    }
-    else {
-      dataArray.io.r.req.valid := port_0_read_1 || port_1_read_1
-      dataArray.io.r.req.bits.apply(setIdx=bank_1_idx(highestIdxBit,1))
-      dataArray.io.w.req.valid := write_bank_1
-      dataArray.io.w.req.bits.apply(data=write_data_bits, setIdx=io.write.bits.virIdx(highestIdxBit,1), waymask=io.write.bits.waymask)
-    }
-
-    dataArray
-  }
-
-  val codeArrays = (0 until 2) map { i => 
-    val codeArray = Module(new SRAMTemplate(
-      UInt(dataCodeEntryBits.W),
-      set=nSets/2,
-      way=nWays,
-      shouldReset = true,
-      holdRead = true,
-      singlePort = true
-    ))
-
-    if(i == 0) {
-      codeArray.io.r.req.valid := port_0_read_0 || port_1_read_0
-      codeArray.io.r.req.bits.apply(setIdx=bank_0_idx(highestIdxBit,1))
-      codeArray.io.w.req.valid := write_bank_0
-      codeArray.io.w.req.bits.apply(data=write_data_code, setIdx=io.write.bits.virIdx(highestIdxBit,1), waymask=io.write.bits.waymask)
-    }
-    else {
-      codeArray.io.r.req.valid := port_0_read_1 || port_1_read_1
-      codeArray.io.r.req.bits.apply(setIdx=bank_1_idx(highestIdxBit,1))
-      codeArray.io.w.req.valid := write_bank_1
-      codeArray.io.w.req.bits.apply(data=write_data_code, setIdx=io.write.bits.virIdx(highestIdxBit,1), waymask=io.write.bits.waymask)
-    }
-    
-    codeArray
-  }
-
-  //Parity Decode
-  val read_datas = Wire(Vec(2,Vec(nWays,UInt(blockBits.W) )))
-  val read_codes = Wire(Vec(2,Vec(nWays,UInt(dataCodeEntryBits.W) )))
-  for(((dataArray,codeArray),i) <- dataArrays.zip(codeArrays).zipWithIndex){
-    read_datas(i) := dataArray.io.r.resp.asTypeOf(Vec(nWays,UInt(blockBits.W)))
-    read_codes(i) := codeArray.io.r.resp.asTypeOf(Vec(nWays,UInt(dataCodeEntryBits.W)))
-  } 
-
-
-  //Parity Encode
-  val write = io.write.bits
-  val write_data = WireInit(write.data)
-  write_data_code := getECCFromBlock(write_data).asUInt
-  write_data_bits := write_data
-
-  io.readResp.datas(0) := Mux( port_0_read_1_reg, read_datas(1) , read_datas(0))
-  io.readResp.datas(1) := Mux( port_1_read_0_reg, read_datas(0) , read_datas(1))
-  io.readResp.codes(0) := Mux( port_0_read_1_reg, read_codes(1) , read_codes(0))
-  io.readResp.codes(1) := Mux( port_1_read_0_reg, read_codes(0) , read_codes(1))
-
-  io.write.ready := true.B
-
-  // deal with customized cache op
-  require(nWays <= 32)
-  io.cacheOp.resp.bits := DontCare
-  val cacheOpShouldResp = WireInit(false.B) 
-  when(io.cacheOp.req.valid){
-    when(
-      CacheInstrucion.isReadData(io.cacheOp.req.bits.opCode) ||
-      CacheInstrucion.isReadDataECC(io.cacheOp.req.bits.opCode)
-    ){
-      (0 until 2).map(i => {
-        dataArrays(i).io.r.req.valid := true.B
-        dataArrays(i).io.r.req.bits.apply(setIdx = io.cacheOp.req.bits.index)
-      })
-      cacheOpShouldResp := true.B
-    }
-    when(CacheInstrucion.isWriteData(io.cacheOp.req.bits.opCode)){
-      (0 until 2).map(i => {
-        dataArrays(i).io.w.req.valid := io.cacheOp.req.bits.bank_num === i.U
-        dataArrays(i).io.w.req.bits.setIdx := io.cacheOp.req.bits.index
-        dataArrays(i).io.w.req.bits.waymask match {
-          case Some(waymask) => waymask := UIntToOH(io.cacheOp.req.bits.wayNum(4, 0))
-          case None =>
-        }
-      })
-      write_data := io.cacheOp.req.bits.write_data_vec.asTypeOf(write_data.cloneType)
-      cacheOpShouldResp := true.B
-    }
-  }
-  io.cacheOp.resp.valid := RegNext(io.cacheOp.req.valid && cacheOpShouldResp)
-  val dataresp = Mux(io.cacheOp.req.bits.bank_num(0).asBool,
-    read_datas(1),
-    read_datas(0)
-  )
-  
-  val numICacheLineWords = blockBits / 64 
-  require(blockBits >= 64 && isPow2(blockBits))
-  for (wordIndex <- 0 until numICacheLineWords) {
-    io.cacheOp.resp.bits.read_data_vec(wordIndex) := dataresp(io.cacheOp.req.bits.wayNum(4, 0))(64*(wordIndex+1)-1, 64*wordIndex)
-  }
-  // io.cacheOp.resp.bits.read_data_ecc := Mux(io.cacheOp.resp.valid, 
-    // bank_result(io.cacheOp.req.bits.bank_num).ecc, 
-    // 0.U
-  // )
+class ICacheDataArrayIO(implicit p: Parameters) extends ICacheBundle {
+  val write:    DecoupledIO[ICacheDataWriteBundle] = Flipped(DecoupledIO(new ICacheDataWriteBundle))
+  val read:     Vec[DecoupledIO[ICacheReadBundle]] = Flipped(Vec(partWayNum, DecoupledIO(new ICacheReadBundle)))
+  val readResp: ICacheDataRespBundle               = Output(new ICacheDataRespBundle)
 }
 
+class ICacheDataArray(implicit p: Parameters) extends ICacheArray with HasICacheECCHelper {
+  class ICacheDataEntry(implicit p: Parameters) extends ICacheBundle {
+    val data: UInt = UInt(ICacheDataBits.W)
+    val code: UInt = UInt(ICacheDataCodeBits.W)
+  }
 
-class ICacheIO(implicit p: Parameters) extends ICacheBundle
-{
-  val hartId = Input(UInt(8.W))
-  val prefetch    = Flipped(new FtqPrefechBundle)
-  val stop        = Input(Bool())
-  val fetch       = Vec(PortNumber, new ICacheMainPipeBundle)
-  val pmp         = Vec(PortNumber + 1, new ICachePMPBundle)
-  val itlb        = Vec(PortNumber * 2 + 1, new BlockTlbRequestIO)
-  val perfInfo    = Output(new ICachePerfInfo)
-  val error       = new L1CacheErrorInfo
-  /* Cache Instruction */
-  val csr         = new L1CacheToCsrIO
-  /* CSR control signal */
-  val csr_pf_enable = Input(Bool())
-  val csr_parity_enable = Input(Bool())
+  private object ICacheDataEntry {
+    def apply(data: UInt, poison: Bool)(implicit p: Parameters): ICacheDataEntry = {
+      val entry = Wire(new ICacheDataEntry)
+      entry.data := data
+      entry.code := encodeDataECC(data, poison)
+      entry
+    }
+  }
+
+  val io: ICacheDataArrayIO = IO(new ICacheDataArrayIO)
+
+  /**
+    ******************************************************************************
+    * data array
+    ******************************************************************************
+    */
+  private val writeDatas   = io.write.bits.data.asTypeOf(Vec(ICacheDataBanks, UInt(ICacheDataBits.W)))
+  private val writeEntries = writeDatas.map(ICacheDataEntry(_, io.write.bits.poison).asUInt)
+
+  // io.read() are copies to control fan-out, we can simply use .head here
+  private val bankSel  = getBankSel(io.read.head.bits.blkOffset, io.read.head.valid)
+  private val lineSel  = getLineSel(io.read.head.bits.blkOffset)
+  private val waymasks = io.read.head.bits.waymask
+  private val masks    = Wire(Vec(nWays, Vec(ICacheDataBanks, Bool())))
+  (0 until nWays).foreach { way =>
+    (0 until ICacheDataBanks).foreach { bank =>
+      masks(way)(bank) := Mux(
+        lineSel(bank),
+        waymasks(1)(way) && bankSel(1)(bank).asBool,
+        waymasks(0)(way) && bankSel(0)(bank).asBool
+      )
+    }
+  }
+
+  private val dataArrays = (0 until nWays).map { way =>
+    (0 until ICacheDataBanks).map { bank =>
+      val sramBank = Module(new SRAMTemplateWithFixedWidth(
+        UInt(ICacheDataEntryBits.W),
+        set = nSets,
+        width = ICacheDataSRAMWidth,
+        shouldReset = true,
+        holdRead = true,
+        singlePort = true,
+        withClockGate = true
+      ))
+
+      // read
+      sramBank.io.r.req.valid := io.read(bank % 4).valid && masks(way)(bank)
+      sramBank.io.r.req.bits.apply(setIdx =
+        Mux(lineSel(bank), io.read(bank % 4).bits.vSetIdx(1), io.read(bank % 4).bits.vSetIdx(0))
+      )
+      // write
+      sramBank.io.w.req.valid := io.write.valid && io.write.bits.waymask(way).asBool
+      sramBank.io.w.req.bits.apply(
+        data = writeEntries(bank),
+        setIdx = io.write.bits.virIdx,
+        // waymask is invalid when way of SRAMTemplate <= 1
+        waymask = 0.U
+      )
+      sramBank
+    }
+  }
+
+  /**
+    ******************************************************************************
+    * read logic
+    ******************************************************************************
+    */
+  private val masksReg = RegEnable(masks, 0.U.asTypeOf(masks), io.read(0).valid)
+  private val readDataWithCode = (0 until ICacheDataBanks).map { bank =>
+    Mux1H(VecInit(masksReg.map(_(bank))).asTypeOf(UInt(nWays.W)), dataArrays.map(_(bank).io.r.resp.asUInt))
+  }
+  private val readEntries = readDataWithCode.map(_.asTypeOf(new ICacheDataEntry()))
+  private val readDatas   = VecInit(readEntries.map(_.data))
+  private val readCodes   = VecInit(readEntries.map(_.code))
+
+  // TEST: force ECC to fail by setting readCodes to 0
+  if (ICacheForceDataECCError) {
+    readCodes.foreach(_ := 0.U)
+  }
+
+  /**
+    ******************************************************************************
+    * IO
+    ******************************************************************************
+    */
+  io.readResp.datas := readDatas
+  io.readResp.codes := readCodes
+  io.write.ready    := true.B
+  io.read.foreach(_.ready := !io.write.valid)
+}
+
+class ICacheReplacerIO(implicit p: Parameters) extends ICacheBundle {
+  val touch:  Vec[Valid[ReplacerTouch]] = Vec(PortNumber, Flipped(ValidIO(new ReplacerTouch)))
+  val victim: ReplacerVictim            = Flipped(new ReplacerVictim)
+}
+
+class ICacheReplacer(implicit p: Parameters) extends ICacheModule {
+  val io: ICacheReplacerIO = IO(new ICacheReplacerIO)
+
+  private val replacers =
+    Seq.fill(PortNumber)(ReplacementPolicy.fromString(cacheParams.replacer, nWays, nSets / PortNumber))
+
+  // touch
+  private val touch_sets = Seq.fill(PortNumber)(Wire(Vec(PortNumber, UInt(log2Ceil(nSets / PortNumber).W))))
+  private val touch_ways = Seq.fill(PortNumber)(Wire(Vec(PortNumber, Valid(UInt(wayBits.W)))))
+  (0 until PortNumber).foreach { i =>
+    touch_sets(i)(0) := Mux(
+      io.touch(i).bits.vSetIdx(0),
+      io.touch(1).bits.vSetIdx(highestIdxBit, 1),
+      io.touch(0).bits.vSetIdx(highestIdxBit, 1)
+    )
+    touch_ways(i)(0).bits  := Mux(io.touch(i).bits.vSetIdx(0), io.touch(1).bits.way, io.touch(0).bits.way)
+    touch_ways(i)(0).valid := Mux(io.touch(i).bits.vSetIdx(0), io.touch(1).valid, io.touch(0).valid)
+  }
+
+  // victim
+  io.victim.way := Mux(
+    io.victim.vSetIdx.bits(0),
+    replacers(1).way(io.victim.vSetIdx.bits(highestIdxBit, 1)),
+    replacers(0).way(io.victim.vSetIdx.bits(highestIdxBit, 1))
+  )
+
+  // touch the victim in next cycle
+  private val victim_vSetIdx_reg =
+    RegEnable(io.victim.vSetIdx.bits, 0.U.asTypeOf(io.victim.vSetIdx.bits), io.victim.vSetIdx.valid)
+  private val victim_way_reg = RegEnable(io.victim.way, 0.U.asTypeOf(io.victim.way), io.victim.vSetIdx.valid)
+  (0 until PortNumber).foreach { i =>
+    touch_sets(i)(1)       := victim_vSetIdx_reg(highestIdxBit, 1)
+    touch_ways(i)(1).bits  := victim_way_reg
+    touch_ways(i)(1).valid := RegNext(io.victim.vSetIdx.valid) && (victim_vSetIdx_reg(0) === i.U)
+  }
+
+  ((replacers zip touch_sets) zip touch_ways).foreach { case ((r, s), w) => r.access(s, w) }
+}
+
+class ICacheIO(implicit p: Parameters) extends ICacheBundle {
+  val hartId: UInt = Input(UInt(hartIdLen.W))
+  // FTQ
+  val fetch:       ICacheMainPipeBundle = new ICacheMainPipeBundle
+  val ftqPrefetch: FtqToPrefetchIO      = Flipped(new FtqToPrefetchIO)
+  // memblock
+  val softPrefetch: Vec[Valid[SoftIfetchPrefetchBundle]] =
+    Vec(backendParams.LduCnt, Flipped(Valid(new SoftIfetchPrefetchBundle)))
+  // IFU
+  val stop:  Bool = Input(Bool())
+  val toIFU: Bool = Output(Bool())
+  // PMP: mainPipe & prefetchPipe need PortNumber each
+  val pmp: Vec[ICachePMPBundle] = Vec(2 * PortNumber, new ICachePMPBundle)
+  // iTLB
+  val itlb:          Vec[TlbRequestIO] = Vec(PortNumber, new TlbRequestIO)
+  val itlbFlushPipe: Bool              = Bool()
+  // backend/BEU
+  val error: Valid[L1CacheErrorInfo] = ValidIO(new L1CacheErrorInfo)
+  // backend/CSR
+  val csr_pf_enable: Bool = Input(Bool())
+  // flush
+  val fencei: Bool = Input(Bool())
+  val flush:  Bool = Input(Bool())
+
+  // perf
+  val perfInfo: ICachePerfInfo = Output(new ICachePerfInfo)
 }
 
 class ICache()(implicit p: Parameters) extends LazyModule with HasICacheParameters {
+  override def shouldBeInlined: Boolean = false
 
-  val clientParameters = TLMasterPortParameters.v1(
+  val clientParameters: TLMasterPortParameters = TLMasterPortParameters.v1(
     Seq(TLMasterParameters.v1(
       name = "icache",
-      sourceId = IdRange(0, cacheParams.nMissEntries + cacheParams.nReleaseEntries),
-      supportsProbe = TransferSizes(blockBytes),
-      supportsHint = TransferSizes(blockBytes)
+      sourceId = IdRange(0, cacheParams.nFetchMshr + cacheParams.nPrefetchMshr + 1)
     )),
     requestFields = cacheParams.reqFields,
     echoFields = cacheParams.echoFields
   )
 
-  val clientNode = TLClientNode(Seq(clientParameters))
+  val clientNode: TLClientNode = TLClientNode(Seq(clientParameters))
 
-  lazy val module = new ICacheImp(this)
+  val ctrlUnitOpt: Option[ICacheCtrlUnit] = ctrlUnitParamsOpt.map(params => LazyModule(new ICacheCtrlUnit(params)))
+
+  lazy val module: ICacheImp = new ICacheImp(this)
 }
 
 class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParameters with HasPerfEvents {
-  val io = IO(new ICacheIO)
+  val io: ICacheIO = IO(new ICacheIO)
 
   println("ICache:")
-  println("  ICacheSets: "          + cacheParams.nSets)
-  println("  ICacheWays: "          + cacheParams.nWays)
-  println("  ICacheBanks: "         + PortNumber)
-  println("  hasPrefetch: "         + cacheParams.hasPrefetch)
-  if(cacheParams.hasPrefetch){
-    println("  nPrefetchEntries: "         + cacheParams.nPrefetchEntries)
-  }
+  println("  TagECC: " + cacheParams.tagECC)
+  println("  DataECC: " + cacheParams.dataECC)
+  println("  ICacheSets: " + cacheParams.nSets)
+  println("  ICacheWays: " + cacheParams.nWays)
+  println("  PortNumber: " + cacheParams.PortNumber)
+  println("  nFetchMshr: " + cacheParams.nFetchMshr)
+  println("  nPrefetchMshr: " + cacheParams.nPrefetchMshr)
+  println("  nWayLookupSize: " + cacheParams.nWayLookupSize)
+  println("  DataCodeUnit: " + cacheParams.DataCodeUnit)
+  println("  ICacheDataBanks: " + cacheParams.ICacheDataBanks)
+  println("  ICacheDataSRAMWidth: " + cacheParams.ICacheDataSRAMWidth)
 
   val (bus, edge) = outer.clientNode.out.head
 
-  val metaArray      = Module(new ICacheMetaArray)
-  val dataArray      = Module(new ICacheDataArray)
-  val mainPipe       = Module(new ICacheMainPipe)
-  val missUnit      = Module(new ICacheMissUnit(edge))
-  val releaseUnit    = Module(new ReleaseUnit(edge))
-  val replacePipe     = Module(new ICacheReplacePipe)
-  val probeQueue     = Module(new ICacheProbeQueue(edge))
-  val prefetchPipe    = Module(new IPrefetchPipe)
+  private val metaArray  = Module(new ICacheMetaArray)
+  private val dataArray  = Module(new ICacheDataArray)
+  private val mainPipe   = Module(new ICacheMainPipe)
+  private val missUnit   = Module(new ICacheMissUnit(edge))
+  private val replacer   = Module(new ICacheReplacer)
+  private val prefetcher = Module(new IPrefetchPipe)
+  private val wayLookup  = Module(new WayLookup)
 
-  val meta_read_arb   = Module(new Arbiter(new ICacheReadBundle,  3))
-  val data_read_arb   = Module(new Arbiter(new ICacheReadBundle,  2))
-  val meta_write_arb  = Module(new Arbiter(new ICacheMetaWriteBundle(),  2 ))
-  val replace_req_arb = Module(new Arbiter(new ReplacePipeReq, 2))
-  // val tlb_req_arb     = Module(new Arbiter(new TlbReq, 2))
+  private val ecc_enable = if (outer.ctrlUnitOpt.nonEmpty) outer.ctrlUnitOpt.get.module.io.ecc_enable else true.B
 
-  meta_read_arb.io.in(ReplacePipeKey)   <> replacePipe.io.meta_read
-  meta_read_arb.io.in(MainPipeKey)      <> mainPipe.io.metaArray.toIMeta
-  meta_read_arb.io.in(2)                <> prefetchPipe.io.toIMeta
-  metaArray.io.read                     <> meta_read_arb.io.out
-
-  replacePipe.io.meta_response          <> metaArray.io.readResp
-  mainPipe.io.metaArray.fromIMeta       <> metaArray.io.readResp
-  prefetchPipe.io.fromIMeta             <> metaArray.io.readResp
-
-  data_read_arb.io.in(ReplacePipeKey) <> replacePipe.io.data_read
-  data_read_arb.io.in(MainPipeKey)    <> mainPipe.io.dataArray.toIData
-  dataArray.io.read                   <> data_read_arb.io.out
-  replacePipe.io.data_response        <> dataArray.io.readResp
-  mainPipe.io.dataArray.fromIData     <> dataArray.io.readResp
-
-  mainPipe.io.respStall := io.stop
-  io.perfInfo := mainPipe.io.perfInfo
-
-  meta_write_arb.io.in(ReplacePipeKey)  <> replacePipe.io.meta_write
-  meta_write_arb.io.in(MainPipeKey)     <> missUnit.io.meta_write
-
-  metaArray.io.write <> meta_write_arb.io.out
-  dataArray.io.write <> missUnit.io.data_write
-
-  mainPipe.io.csr_parity_enable := io.csr_parity_enable
-  replacePipe.io.csr_parity_enable := io.csr_parity_enable
-
-  if(cacheParams.hasPrefetch){
-    prefetchPipe.io.fromFtq <> io.prefetch
-    when(!io.csr_pf_enable){
-      prefetchPipe.io.fromFtq.req.valid := false.B
-      io.prefetch.req.ready := true.B
+  // dataArray io
+  if (outer.ctrlUnitOpt.nonEmpty) {
+    val ctrlUnit = outer.ctrlUnitOpt.get.module
+    when(ctrlUnit.io.injecting) {
+      dataArray.io.write <> ctrlUnit.io.dataWrite
+      missUnit.io.data_write.ready := false.B
+    }.otherwise {
+      ctrlUnit.io.dataWrite.ready := false.B
+      dataArray.io.write <> missUnit.io.data_write
     }
   } else {
-    prefetchPipe.io.fromFtq <> DontCare
+    dataArray.io.write <> missUnit.io.data_write
   }
+  dataArray.io.read <> mainPipe.io.dataArray.toIData
+  mainPipe.io.dataArray.fromIData := dataArray.io.readResp
+
+  // metaArray io
+  metaArray.io.flushAll := io.fencei
+  metaArray.io.flush <> mainPipe.io.metaArrayFlush
+  if (outer.ctrlUnitOpt.nonEmpty) {
+    val ctrlUnit = outer.ctrlUnitOpt.get.module
+    when(ctrlUnit.io.injecting) {
+      metaArray.io.write <> ctrlUnit.io.metaWrite
+      metaArray.io.read <> ctrlUnit.io.metaRead
+      missUnit.io.meta_write.ready         := false.B
+      prefetcher.io.metaRead.toIMeta.ready := false.B
+    }.otherwise {
+      ctrlUnit.io.metaWrite.ready := false.B
+      ctrlUnit.io.metaRead.ready  := false.B
+      metaArray.io.write <> missUnit.io.meta_write
+      metaArray.io.read <> prefetcher.io.metaRead.toIMeta
+    }
+    ctrlUnit.io.metaReadResp := metaArray.io.readResp
+  } else {
+    metaArray.io.write <> missUnit.io.meta_write
+    metaArray.io.read <> prefetcher.io.metaRead.toIMeta
+  }
+  prefetcher.io.metaRead.fromIMeta := metaArray.io.readResp
+
+  prefetcher.io.flush         := io.flush
+  prefetcher.io.csr_pf_enable := io.csr_pf_enable
+  prefetcher.io.ecc_enable    := ecc_enable
+  prefetcher.io.MSHRResp      := missUnit.io.fetch_resp
+  prefetcher.io.flushFromBpu  := io.ftqPrefetch.flushFromBpu
+  // cache softPrefetch
+  private val softPrefetchValid = RegInit(false.B)
+  private val softPrefetch      = RegInit(0.U.asTypeOf(new IPrefetchReq))
+  /* FIXME:
+   * If there is already a pending softPrefetch request, it will be overwritten.
+   * Also, if there are multiple softPrefetch requests in the same cycle, only the first one will be accepted.
+   * We should implement a softPrefetchQueue (like ibuffer, multi-in, single-out) to solve this.
+   * However, the impact on performance still needs to be assessed.
+   * Considering that the frequency of prefetch.i may not be high, let's start with a temporary dummy solution.
+   */
+  when(io.softPrefetch.map(_.valid).reduce(_ || _)) {
+    softPrefetchValid := true.B
+    softPrefetch.fromSoftPrefetch(MuxCase(
+      0.U.asTypeOf(new SoftIfetchPrefetchBundle),
+      io.softPrefetch.map(req => req.valid -> req.bits)
+    ))
+  }.elsewhen(prefetcher.io.req.fire) {
+    softPrefetchValid := false.B
+  }
+  // pass ftqPrefetch
+  private val ftqPrefetch = WireInit(0.U.asTypeOf(new IPrefetchReq))
+  ftqPrefetch.fromFtqICacheInfo(io.ftqPrefetch.req.bits)
+  // software prefetch has higher priority
+  prefetcher.io.req.valid                 := softPrefetchValid || io.ftqPrefetch.req.valid
+  prefetcher.io.req.bits                  := Mux(softPrefetchValid, softPrefetch, ftqPrefetch)
+  prefetcher.io.req.bits.backendException := io.ftqPrefetch.backendException
+  io.ftqPrefetch.req.ready                := prefetcher.io.req.ready && !softPrefetchValid
+
+  missUnit.io.hartId := io.hartId
+  missUnit.io.fencei := io.fencei
+  missUnit.io.flush  := io.flush
+  missUnit.io.fetch_req <> mainPipe.io.mshr.req
+  missUnit.io.prefetch_req <> prefetcher.io.MSHRReq
+  missUnit.io.mem_grant.valid := false.B
+  missUnit.io.mem_grant.bits  := DontCare
+  missUnit.io.mem_grant <> bus.d
+
+  mainPipe.io.flush      := io.flush
+  mainPipe.io.respStall  := io.stop
+  mainPipe.io.ecc_enable := ecc_enable
+  mainPipe.io.hartId     := io.hartId
+  mainPipe.io.mshr.resp  := missUnit.io.fetch_resp
+  mainPipe.io.fetch.req <> io.fetch.req
+  mainPipe.io.wayLookupRead <> wayLookup.io.read
+
+  wayLookup.io.flush := io.flush
+  wayLookup.io.write <> prefetcher.io.wayLookupWrite
+  wayLookup.io.update := missUnit.io.fetch_resp
+
+  replacer.io.touch <> mainPipe.io.touch
+  replacer.io.victim <> missUnit.io.victim
 
   io.pmp(0) <> mainPipe.io.pmp(0)
   io.pmp(1) <> mainPipe.io.pmp(1)
-  io.pmp(2) <> prefetchPipe.io.pmp
+  io.pmp(2) <> prefetcher.io.pmp(0)
+  io.pmp(3) <> prefetcher.io.pmp(1)
 
-  prefetchPipe.io.prefetchEnable := mainPipe.io.prefetchEnable
-  prefetchPipe.io.prefetchDisable := mainPipe.io.prefetchDisable
+  io.itlb(0) <> prefetcher.io.itlb(0)
+  io.itlb(1) <> prefetcher.io.itlb(1)
+  io.itlbFlushPipe := prefetcher.io.itlbFlushPipe
 
+  // notify IFU that Icache pipeline is available
+  io.toIFU    := mainPipe.io.fetch.req.ready
+  io.perfInfo := mainPipe.io.perfInfo
 
-  // tlb_req_arb.io.in(0) <> mainPipe.io.itlb(0).req
-  // tlb_req_arb.io.in(1) <> prefetchPipe.io.iTLBInter.req
-  // io.itlb(0).req       <>    tlb_req_arb.io.out
-
-  // mainPipe.io.itlb(0).resp  <>  io.itlb(0).resp
-  // prefetchPipe.io.iTLBInter.resp  <>  io.itlb(0).resp
-
-  // when(mainPipe.io.itlb(0).req.fire() && prefetchPipe.io.iTLBInter.req.fire())
-  // {
-  //   assert(false.B, "Both mainPipe ITLB and prefetchPipe ITLB fire!")
-  // }
-
-  io.itlb(0)        <>    mainPipe.io.itlb(0)
-  io.itlb(1)        <>    mainPipe.io.itlb(1)
-  io.itlb(2)        <>    mainPipe.io.itlb(2)
-  io.itlb(3)        <>    mainPipe.io.itlb(3)
-  io.itlb(4)        <>    prefetchPipe.io.iTLBInter
-
-  for(i <- 0 until PortNumber){
-    io.fetch(i).resp     <>    mainPipe.io.fetch(i).resp
-
-    missUnit.io.req(i)           <>   mainPipe.io.mshr(i).toMSHR
-    mainPipe.io.mshr(i).fromMSHR <>   missUnit.io.resp(i)
-
-  }
-
-  missUnit.io.prefetch_req <> prefetchPipe.io.toMissUnit.enqReq
-  missUnit.io.hartId       := io.hartId
-  prefetchPipe.io.fromMSHR <> missUnit.io.prefetch_check
+  io.fetch.resp <> mainPipe.io.fetch.resp
+  io.fetch.topdownIcacheMiss := mainPipe.io.fetch.topdownIcacheMiss
+  io.fetch.topdownItlbMiss   := mainPipe.io.fetch.topdownItlbMiss
 
   bus.b.ready := false.B
   bus.c.valid := false.B
@@ -577,106 +719,158 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   bus.e.bits  := DontCare
 
   bus.a <> missUnit.io.mem_acquire
-  bus.e <> missUnit.io.mem_finish
 
-  releaseUnit.io.req <>  replacePipe.io.release_req
-  replacePipe.io.release_finish := releaseUnit.io.finish
-  bus.c <> releaseUnit.io.mem_release
+  // Parity error port
+  private val errors       = mainPipe.io.errors
+  private val errors_valid = errors.map(e => e.valid).reduce(_ | _)
+  io.error.bits <> RegEnable(
+    PriorityMux(errors.map(e => e.valid -> e.bits)),
+    0.U.asTypeOf(errors(0).bits),
+    errors_valid
+  )
+  io.error.valid := RegNext(errors_valid, false.B)
 
-  // connect bus d
-  missUnit.io.mem_grant.valid := false.B
-  missUnit.io.mem_grant.bits  := DontCare
+  XSPerfAccumulate(
+    "softPrefetch_drop_not_ready",
+    io.softPrefetch.map(_.valid).reduce(_ || _) && softPrefetchValid && !prefetcher.io.req.fire
+  )
+  XSPerfAccumulate("softPrefetch_drop_multi_req", PopCount(io.softPrefetch.map(_.valid)) > 1.U)
+  XSPerfAccumulate("softPrefetch_block_ftq", softPrefetchValid && io.ftqPrefetch.req.valid)
 
-  releaseUnit.io.mem_grant.valid := false.B
-  releaseUnit.io.mem_grant.bits  := DontCare
-
-  //Probe through bus b
-  probeQueue.io.mem_probe    <> bus.b
-
-  //Parity error port
-  val errors = mainPipe.io.errors ++ Seq(replacePipe.io.error)
-  io.error <> RegNext(Mux1H(errors.map(e => e.valid -> e)))
-
-
-  /** Block set-conflict request */
- val probeReqValid = probeQueue.io.pipe_req.valid
- val probeReqVidx  = probeQueue.io.pipe_req.bits.vidx
-
-  val hasVictim = VecInit(missUnit.io.victimInfor.map(_.valid))
-  val victimSetSeq = VecInit(missUnit.io.victimInfor.map(_.vidx))
-
-  val probeShouldBlock = VecInit(hasVictim.zip(victimSetSeq).map{case(valid, idx) =>  valid && probeReqValid && idx === probeReqVidx }).reduce(_||_)
-
- val releaseReqValid = missUnit.io.release_req.valid
- val releaseReqVidx  = missUnit.io.release_req.bits.vidx
-
-  val hasConflict = VecInit(Seq(
-        replacePipe.io.status.r1_set.valid,
-        replacePipe.io.status.r2_set.valid,
-        replacePipe.io.status.r3_set.valid
-  ))
-
-  val conflictIdx = VecInit(Seq(
-        replacePipe.io.status.r1_set.bits,
-        replacePipe.io.status.r2_set.bits,
-        replacePipe.io.status.r3_set.bits
-  ))
-
-  val releaseShouldBlock = VecInit(hasConflict.zip(conflictIdx).map{case(valid, idx) =>  valid && releaseReqValid && idx === releaseReqVidx }).reduce(_||_)
-
-  replace_req_arb.io.in(ReplacePipeKey) <> probeQueue.io.pipe_req
-  replace_req_arb.io.in(ReplacePipeKey).valid := probeQueue.io.pipe_req.valid && !probeShouldBlock
-  replace_req_arb.io.in(MainPipeKey)   <> missUnit.io.release_req
-  replace_req_arb.io.in(MainPipeKey).valid := missUnit.io.release_req.valid && !releaseShouldBlock
-  replacePipe.io.pipe_req               <> replace_req_arb.io.out
-
-  when(releaseShouldBlock){
-    missUnit.io.release_req.ready := false.B
-  }
-
-  when(probeShouldBlock){
-    probeQueue.io.pipe_req.ready := false.B
-  }
-
-
-  missUnit.io.release_resp <> replacePipe.io.pipe_resp
-
-  
-  (0 until PortNumber).map{i => 
-      mainPipe.io.fetch(i).req.valid := io.fetch(i).req.valid //&& !fetchShouldBlock(i)
-      io.fetch(i).req.ready          :=  mainPipe.io.fetch(i).req.ready //&& !fetchShouldBlock(i)
-      mainPipe.io.fetch(i).req.bits  := io.fetch(i).req.bits
-  }
-
-  // in L1ICache, we only expect GrantData and ReleaseAck
-  bus.d.ready := false.B
-  when ( bus.d.bits.opcode === TLMessages.GrantData) {
-    missUnit.io.mem_grant <> bus.d
-  } .elsewhen (bus.d.bits.opcode === TLMessages.ReleaseAck) {
-    releaseUnit.io.mem_grant <> bus.d
-  } .otherwise {
-    assert (!bus.d.fire())
-  }
-
-  val perfEvents = Seq(
+  val perfEvents: Seq[(String, Bool)] = Seq(
     ("icache_miss_cnt  ", false.B),
-    ("icache_miss_penty", BoolStopWatch(start = false.B, stop = false.B || false.B, startHighPriority = true)),
+    ("icache_miss_penalty", BoolStopWatch(start = false.B, stop = false.B || false.B, startHighPriority = true))
   )
   generatePerfEvent()
+}
 
-  // Customized csr cache op support
-  val cacheOpDecoder = Module(new CSRCacheOpDecoder("icache", CacheInstrucion.COP_ID_ICACHE))
-  cacheOpDecoder.io.csr <> io.csr
-  dataArray.io.cacheOp.req := cacheOpDecoder.io.cache.req
-  metaArray.io.cacheOp.req := cacheOpDecoder.io.cache.req
-  cacheOpDecoder.io.cache.resp.valid := 
-    dataArray.io.cacheOp.resp.valid ||
-    metaArray.io.cacheOp.resp.valid
-  cacheOpDecoder.io.cache.resp.bits := Mux1H(List(
-    dataArray.io.cacheOp.resp.valid -> dataArray.io.cacheOp.resp.bits,
-    metaArray.io.cacheOp.resp.valid -> metaArray.io.cacheOp.resp.bits,
-  ))
-  cacheOpDecoder.io.error := io.error
-  assert(!((dataArray.io.cacheOp.resp.valid +& metaArray.io.cacheOp.resp.valid) > 1.U))
+//class ICachePartWayReadBundle[T <: Data](gen: T, pWay: Int)(implicit p: Parameters)
+//    extends ICacheBundle {
+//  val req = Flipped(Vec(
+//    PortNumber,
+//    Decoupled(new Bundle {
+//      val ridx = UInt((log2Ceil(nSets) - 1).W)
+//    })
+//  ))
+//  val resp = Output(new Bundle {
+//    val rdata = Vec(PortNumber, Vec(pWay, gen))
+//  })
+//}
 
-} 
+//class ICacheWriteBundle[T <: Data](gen: T, pWay: Int)(implicit p: Parameters)
+//    extends ICacheBundle {
+//  val wdata    = gen
+//  val widx     = UInt((log2Ceil(nSets) - 1).W)
+//  val wbankidx = Bool()
+//  val wmask    = Vec(pWay, Bool())
+//}
+
+//class ICachePartWayArray[T <: Data](gen: T, pWay: Int)(implicit p: Parameters) extends ICacheArray {
+//
+//  // including part way data
+//  val io = IO {
+//    new Bundle {
+//      val read  = new ICachePartWayReadBundle(gen, pWay)
+//      val write = Flipped(ValidIO(new ICacheWriteBundle(gen, pWay)))
+//    }
+//  }
+//
+//  io.read.req.map(_.ready := !io.write.valid)
+//
+//  val srams = (0 until PortNumber) map { bank =>
+//    val sramBank = Module(new SRAMTemplate(
+//      gen,
+//      set = nSets / 2,
+//      way = pWay,
+//      shouldReset = true,
+//      holdRead = true,
+//      singlePort = true,
+//      withClockGate = true
+//    ))
+//
+//    sramBank.io.r.req.valid := io.read.req(bank).valid
+//    sramBank.io.r.req.bits.apply(setIdx = io.read.req(bank).bits.ridx)
+//
+//    if (bank == 0) sramBank.io.w.req.valid := io.write.valid && !io.write.bits.wbankidx
+//    else sramBank.io.w.req.valid           := io.write.valid && io.write.bits.wbankidx
+//    sramBank.io.w.req.bits.apply(
+//      data = io.write.bits.wdata,
+//      setIdx = io.write.bits.widx,
+//      waymask = io.write.bits.wmask.asUInt
+//    )
+//
+//    sramBank
+//  }
+//
+//  io.read.req.map(_.ready := !io.write.valid && srams.map(_.io.r.req.ready).reduce(_ && _))
+//
+//  io.read.resp.rdata := VecInit(srams.map(bank => bank.io.r.resp.asTypeOf(Vec(pWay, gen))))
+//
+//}
+
+class SRAMTemplateWithFixedWidthIO[T <: Data](gen: T, set: Int, way: Int) extends Bundle {
+  val r: SRAMReadBus[T]  = Flipped(new SRAMReadBus(gen, set, way))
+  val w: SRAMWriteBus[T] = Flipped(new SRAMWriteBus(gen, set, way))
+}
+
+// Automatically partition the SRAM based on the width of the data and the desired width.
+// final SRAM width = width * way
+class SRAMTemplateWithFixedWidth[T <: Data](
+    gen:           T,
+    set:           Int,
+    width:         Int,
+    way:           Int = 1,
+    shouldReset:   Boolean = false,
+    holdRead:      Boolean = false,
+    singlePort:    Boolean = false,
+    bypassWrite:   Boolean = false,
+    withClockGate: Boolean = false
+) extends Module {
+
+  private val dataBits  = gen.getWidth
+  private val bankNum   = math.ceil(dataBits.toDouble / width.toDouble).toInt
+  private val totalBits = bankNum * width
+
+  val io: SRAMTemplateWithFixedWidthIO[T] = IO(new SRAMTemplateWithFixedWidthIO(gen, set, way))
+
+  private val wordType = UInt(width.W)
+  private val writeDatas = (0 until bankNum).map { bank =>
+    VecInit((0 until way).map { i =>
+      io.w.req.bits.data(i).asTypeOf(UInt(totalBits.W)).asTypeOf(Vec(bankNum, wordType))(bank)
+    })
+  }
+
+  private val srams = (0 until bankNum) map { bank =>
+    val sramBank = Module(new SRAMTemplate(
+      wordType,
+      set = set,
+      way = way,
+      shouldReset = shouldReset,
+      holdRead = holdRead,
+      singlePort = singlePort,
+      bypassWrite = bypassWrite,
+      withClockGate = withClockGate
+    ))
+    // read req
+    sramBank.io.r.req.valid       := io.r.req.valid
+    sramBank.io.r.req.bits.setIdx := io.r.req.bits.setIdx
+
+    // write req
+    sramBank.io.w.req.valid       := io.w.req.valid
+    sramBank.io.w.req.bits.setIdx := io.w.req.bits.setIdx
+    sramBank.io.w.req.bits.data   := writeDatas(bank)
+    sramBank.io.w.req.bits.waymask.foreach(_ := io.w.req.bits.waymask.get)
+
+    sramBank
+  }
+
+  io.r.req.ready := !io.w.req.valid
+  (0 until way).foreach { i =>
+    io.r.resp.data(i) := VecInit((0 until bankNum).map(bank =>
+      srams(bank).io.r.resp.data(i)
+    )).asTypeOf(UInt(totalBits.W))(dataBits - 1, 0).asTypeOf(gen.cloneType)
+  }
+
+  io.r.req.ready := srams.head.io.r.req.ready
+  io.w.req.ready := srams.head.io.w.req.ready
+}

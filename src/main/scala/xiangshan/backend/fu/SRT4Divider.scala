@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -20,10 +21,10 @@
 
 package xiangshan.backend.fu
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import utils.SignExt
+import utility.SignExt
 import xiangshan.backend.fu.util.CSA3_2
 
 /** A Radix-4 SRT Integer Divider
@@ -138,8 +139,8 @@ class SRT4DividerDataModule(len: Int) extends Module {
   // Second cycle, state is pre_0
   // calculate lzc and move div* and lzc diff check if no_iter_needed
 
-  aLZC := PriorityEncoder(aNormAbsReg(len - 1, 0).asBools().reverse)
-  dLZC := PriorityEncoder(dNormAbsReg(len - 1, 0).asBools().reverse)
+  aLZC := PriorityEncoder(aNormAbsReg(len - 1, 0).asBools.reverse)
+  dLZC := PriorityEncoder(dNormAbsReg(len - 1, 0).asBools.reverse)
   val aLZCReg = RegEnable(aLZC, state(s_pre_0)) // 7, 0
   val dLZCReg = RegEnable(dLZC, state(s_pre_0))
 
@@ -150,7 +151,7 @@ class SRT4DividerDataModule(len: Int) extends Module {
   val lzcDiff = Mux(state(s_pre_0), lzcWireDiff, lzcRegDiff)
   aIsZero := aLZC(lzc_width) // this is state pre_0
   dIsZero := dLZCReg(lzc_width) // this is pre_1 and all stages after
-  val dIsOne = dLZC(lzc_width - 1, 0).andR() // this is pre_0
+  val dIsOne = dLZC(lzc_width - 1, 0).andR // this is pre_0
   val noIterReg = RegEnable(dIsOne & aNormAbsReg(len - 1), state(s_pre_0)) // This means dividend has lzc 0 so iter is 17
   noIter := noIterReg
   val aTooSmallReg = RegEnable(aIsZero | lzcDiff(lzc_width), state(s_pre_0)) // a is zero or a smaller than d
@@ -181,8 +182,8 @@ class SRT4DividerDataModule(len: Int) extends Module {
 
   // obtaining 1st quotient
   val rSumInitTrunc = Cat(0.U(1.W), rSumInit(itn_len - 4, itn_len - 4 - 4 + 1)) // 0.00___
-  val mInitPos1 = MuxLookup(dNormAbsReg(len - 2, len - 2 - 3 + 1), "b00100".U(5.W),
-    Array(
+  val mInitPos1 = MuxLookup(dNormAbsReg(len - 2, len - 2 - 3 + 1), "b00100".U(5.W))(
+    Seq(
       0.U -> "b00100".U(5.W),
       1.U -> "b00100".U(5.W),
       2.U -> "b00100".U(5.W),
@@ -193,8 +194,8 @@ class SRT4DividerDataModule(len: Int) extends Module {
       7.U -> "b01000".U(5.W),
     )
   )
-  val mInitPos2 = MuxLookup(dNormAbsReg(len - 2, len - 2 - 3 + 1), "b01100".U(5.W),
-    Array(
+  val mInitPos2 = MuxLookup(dNormAbsReg(len - 2, len - 2 - 3 + 1), "b01100".U(5.W))(
+    Seq(
       0.U -> "b01100".U(5.W),
       1.U -> "b01110".U(5.W),
       2.U -> "b01111".U(5.W),
@@ -285,7 +286,7 @@ class SRT4DividerDataModule(len: Int) extends Module {
 
   val r = aNormAbsReg
   val rPd = dNormAbsReg
-  val rIsZero = ~(r.orR())
+  val rIsZero = ~(r.orR)
   val needCorr = (~dIsZero & ~noIterReg) & Mux(rSignReg, ~r(len) & ~rIsZero, r(len)) // when we get pos rem for d<0 or neg rem for d>0
   rPreShifted := Mux(needCorr, rPd, r)
   val rFinal = RegEnable(rightShifted, state(s_post_1))// right shifted remainder. shift by the number of bits divisor is shifted
@@ -327,7 +328,7 @@ object mLookUpTable {
   // Usage :
   // result := decoder(QMCMinimizer, index, mLookupTable.xxx)
   val minus_m = Seq(
-    Array( // -m[-1]
+    Seq( // -m[-1]
       0.U -> "b00_11010".U,
       1.U -> "b00_11110".U,
       2.U -> "b01_00000".U,
@@ -337,7 +338,7 @@ object mLookUpTable {
       6.U -> "b01_01100".U,
       7.U -> "b01_10000".U
     ),
-    Array( // -m[0]
+    Seq( // -m[0]
       0.U -> "b000_0101".U,
       1.U -> "b000_0110".U,
       2.U -> "b000_0110".U,
@@ -347,7 +348,7 @@ object mLookUpTable {
       6.U -> "b000_1000".U,
       7.U -> "b000_1000".U
     ),
-    Array( //-m[1]
+    Seq( //-m[1]
       0.U -> "b111_1101".U,
       1.U -> "b111_1100".U,
       2.U -> "b111_1100".U,
@@ -357,7 +358,7 @@ object mLookUpTable {
       6.U -> "b111_1010".U,
       7.U -> "b111_1010".U
     ),
-    Array( //-m[2]
+    Seq( //-m[2]
       0.U -> "b11_01000".U,
       1.U -> "b11_00100".U,
       2.U -> "b11_00010".U,
@@ -410,7 +411,7 @@ class SRT4QDS(len: Int, itn_len: Int) extends Module {
         csa1.io.in(1) := trunc25(remCarryX16)
         csa2.io.in(2) := trunc25(dXq)
       }
-      csa1.io.in(2) := MuxLookup(dForLookup, "b0000000".U, mLookUpTable.minus_m(i))
+      csa1.io.in(2) := MuxLookup(dForLookup, "b0000000".U)(mLookUpTable.minus_m(i))
       csa2.io.in(0) := csa1.io.out(0)
       csa2.io.in(1) := csa1.io.out(1)(5, 0) << 1
       (csa2.io.out(0) + (csa2.io.out(1)(5, 0) << 1))(6)
@@ -429,7 +430,7 @@ class SRT4QDS(len: Int, itn_len: Int) extends Module {
 
 class SRT4Divider(len: Int)(implicit p: Parameters) extends AbstractDivider(len) {
 
-  val newReq = io.in.fire()
+  val newReq = io.in.fire
 
   val uop = io.in.bits.uop
   val uopReg = RegEnable(uop, newReq)

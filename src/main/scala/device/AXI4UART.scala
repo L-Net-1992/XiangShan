@@ -18,9 +18,10 @@ package device
 
 import chisel3._
 import chisel3.util._
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.diplomacy.AddressSet
 import utils._
+import utility._
 import difftest._
 
 class AXI4UART
@@ -32,12 +33,14 @@ class AXI4UART
   override lazy val module = new AXI4SlaveModuleImp[UARTIO](this){
     val rxfifo = RegInit(0.U(32.W))
     val txfifo = Reg(UInt(32.W))
-    val stat = RegInit(1.U(32.W))
+    val stat = RegInit(0.U(32.W))
     val ctrl = RegInit(0.U(32.W))
 
-    io.extra.get.out.valid := (waddr(3,0) === 4.U && in.w.fire())
-    io.extra.get.out.ch := in.w.bits.data(7,0)
-    io.extra.get.in.valid := (raddr(3,0) === 0.U && in.r.fire())
+    val txDataPos = (4 % node.portParams.head.beatBytes) * 8;
+
+    io.extra.get.out.valid := (waddr(3,0) === 4.U && in.w.fire)
+    io.extra.get.out.ch := in.w.bits.data(7 + txDataPos, txDataPos)
+    io.extra.get.in.valid := (raddr(3,0) === 0.U && in.r.fire)
 
     val mapping = Map(
       RegMap(0x0, io.extra.get.in.ch, RegMap.Unwritable),
@@ -47,7 +50,7 @@ class AXI4UART
     )
 
     RegMap.generate(mapping, raddr(3,0), in.r.bits.data,
-      waddr(3,0), in.w.fire(), in.w.bits.data, MaskExpand(in.w.bits.strb >> waddr(2,0))
+      waddr(3,0), in.w.fire, in.w.bits.data, MaskExpand(in.w.bits.strb >> waddr(2,0))
     )
   }
 }

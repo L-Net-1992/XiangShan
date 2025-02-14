@@ -16,17 +16,21 @@
 
 package xiangshan.mem
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import utils.{XSDebug, XSInfo}
+import utility.{XSDebug, XSInfo}
 import xiangshan._
-import xiangshan.cache.{DCacheLineIO, DCacheWordReq, MemoryOpConstants}
+import xiangshan.mem.Bundles._
+import xiangshan.cache.{DCacheLineIO, DCacheWordReq, MemoryOpConstants, DCacheWordReqWithVaddr}
 
 // Fake Store buffer for XiangShan Out of Order LSU
+//
+// Note: fake store buffer is out of date, as store buffer is now
+// used as extended dcache miss queue for store
 class FakeSbuffer(implicit p: Parameters) extends XSModule {
   val io = IO(new Bundle() {
-    val in = Vec(StorePipelineWidth, Flipped(Decoupled(new DCacheWordReq)))
+    val in = Vec(StorePipelineWidth, Flipped(Decoupled(new DCacheWordReqWithVaddr)))
     val dcache = new DCacheLineIO
     val forward = Vec(LoadPipelineWidth, Flipped(new LoadForwardQueryIO))
   })
@@ -44,7 +48,7 @@ class FakeSbuffer(implicit p: Parameters) extends XSModule {
 
   val state = RegInit(s_invalid)
 
-  val req = Reg(new DCacheWordReq)
+  val req = Reg(new DCacheWordReqWithVaddr)
 
   XSDebug("state: %d\n", state)
 
@@ -56,7 +60,7 @@ class FakeSbuffer(implicit p: Parameters) extends XSModule {
   // --------------------------------------------
   // s_invalid: receive requests
   when (state === s_invalid) {
-    when (io.in(0).fire()) {
+    when (io.in(0).fire) {
       req   := io.in(0).bits
       state := s_req
     }
@@ -76,14 +80,14 @@ class FakeSbuffer(implicit p: Parameters) extends XSModule {
     dcache_req.bits.mask := wmaskVec.asUInt
     dcache_req.bits.id   := DontCare
 
-    when (dcache_req.fire()) {
+    when (dcache_req.fire) {
       state := s_resp
     }
   }
 
   when (state === s_resp) {
     io.dcache.resp.ready := true.B
-    when (io.dcache.resp.fire()) {
+    when (io.dcache.resp.fire) {
       state := s_invalid
     }
   }
@@ -100,7 +104,7 @@ class FakeSbuffer(implicit p: Parameters) extends XSModule {
     io.forward(i).forwardData := VecInit((0 until 8) map {i => req.data((i + 1) * 8 - 1, i * 8)})
   }
 
-  XSInfo(io.in(0).fire(), "ensbuffer addr 0x%x wdata 0x%x mask %b\n", io.in(0).bits.addr, io.in(0).bits.data, io.in(0).bits.mask)
-  XSInfo(io.in(1).fire(), "ensbuffer addr 0x%x wdata 0x%x mask %b\n", io.in(1).bits.addr, io.in(1).bits.data, io.in(0).bits.mask)
-  XSInfo(io.dcache.req.fire(), "desbuffer addr 0x%x wdata 0x%x mask %b\n", io.dcache.req.bits.addr, io.dcache.req.bits.data, io.dcache.req.bits.mask)
+  XSInfo(io.in(0).fire, "ensbuffer addr 0x%x wdata 0x%x mask %b\n", io.in(0).bits.addr, io.in(0).bits.data, io.in(0).bits.mask)
+  XSInfo(io.in(1).fire, "ensbuffer addr 0x%x wdata 0x%x mask %b\n", io.in(1).bits.addr, io.in(1).bits.data, io.in(0).bits.mask)
+  XSInfo(io.dcache.req.fire, "desbuffer addr 0x%x wdata 0x%x mask %b\n", io.dcache.req.bits.addr, io.dcache.req.bits.data, io.dcache.req.bits.mask)
 }

@@ -16,15 +16,13 @@
 
 package xiangshan.backend.fu
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import utils.{LookupTreeDefault, ParallelMux, ParallelXOR, SignExt, XSDebug, XSError, ZeroExt}
+import utility.{LookupTreeDefault, ParallelMux, ParallelXOR, SignExt, ZeroExt}
+import utility.{XSDebug, XSError}
 import xiangshan._
 import xiangshan.backend.fu.util._
-
-
-
 
 class CountModule(implicit p: Parameters) extends XSModule {
   val io = IO(new Bundle() {
@@ -320,14 +318,14 @@ class CryptoModule(implicit p: Parameters) extends XSModule {
   io.out := Mux(funcReg(4), hashModule.io.out, blockCipherModule.io.out)
 }
 
-class Bku(implicit p: Parameters) extends FunctionUnit with HasPipelineReg {
+class Bku(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg) with HasPipelineReg {
 
   override def latency = 2
 
   val (src1, src2, func) = (
-    io.in.bits.src(0),
-    io.in.bits.src(1),
-    io.in.bits.uop.ctrl.fuOpType
+    io.in.bits.data.src(0),
+    io.in.bits.data.src(1),
+    io.in.bits.ctrl.fuOpType
   )
 
   val countModule = Module(new CountModule)
@@ -355,10 +353,11 @@ class Bku(implicit p: Parameters) extends FunctionUnit with HasPipelineReg {
 
 
   // CountModule, ClmulModule, MiscModule, and CryptoModule have a latency of 1 cycle
-  val funcReg = uopVec(1).ctrl.fuOpType
+  val funcReg = RegEnable(func, io.in.fire)
   val result = Mux(funcReg(5), cryptoModule.io.out,
                   Mux(funcReg(3), countModule.io.out,
                       Mux(funcReg(2),miscModule.io.out, clmulModule.io.out)))
 
-  io.out.bits.data := RegEnable(result, regEnable(2))
+  io.out.bits.res.data := RegEnable(result, regEnable(2))
+  // connectNonPipedCtrlSingal
 }

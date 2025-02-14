@@ -17,28 +17,60 @@ package xiangshan.cache.mmu
 
 import chisel3._
 import chisel3.util._
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import xiangshan.{SfenceBundle, XSModule}
 import utils._
+import utility._
 
 class L2TlbPrefetchIO(implicit p: Parameters) extends MMUIOBaseBundle with HasPtwConst {
   val in = Flipped(ValidIO(new Bundle {
     val vpn = UInt(vpnLen.W)
   }))
-  val out = DecoupledIO(new Bundle {
-    val vpn = UInt(vpnLen.W)
-    val source = UInt(bSourceWidth.W)
-  })
+  val out = DecoupledIO(new L2TlbWithHptwIdBundle)
 }
 
 class L2TlbPrefetch(implicit p: Parameters) extends XSModule with HasPtwConst {
   val io = IO(new L2TlbPrefetchIO())
 
-  val flush = io.sfence.valid || io.csr.satp.changed
-  val next_line = RegEnable(get_next_line(io.in.bits.vpn), io.in.valid)
-  val v = ValidHold(io.in.valid && !flush, io.out.fire(), flush)
+  val OldRecordSize = 4
+  val old_reqs = Reg(Vec(OldRecordSize, UInt(vpnLen.W)))
+  val old_v = RegInit(VecInit(Seq.fill(OldRecordSize)(false.B)))
+  val old_index = RegInit(0.U(log2Ceil(OldRecordSize).W))
 
+  def already_have(vpn: UInt): Bool = {
+    Cat(old_reqs.zip(old_v).map{ case (o,v) => dup(o,vpn) && v}).orR
+  }
+
+  val flush = io.sfence.valid || (io.csr.priv.virt && io.csr.vsatp.changed)
+  val next_line = get_next_line(io.in.bits.vpn)
+  val next_req = RegEnable(next_line, io.in.valid)
+  val input_valid = io.in.valid && !flush && !already_have(next_line)
+  val v = ValidHold(input_valid, io.out.fire, flush)
+  val s2xlate = Wire(UInt(2.W))
+  s2xlate := MuxCase(noS2xlate, Seq(
+    (io.csr.priv.virt && io.csr.vsatp.mode =/= 0.U && io.csr.hgatp.mode =/= 0.U) -> allStage,
+    (io.csr.priv.virt && io.csr.vsatp.mode =/= 0.U) -> onlyStage1,
+    (io.csr.priv.virt && io.csr.hgatp.mode =/= 0.U) -> onlyStage2
+  ))
   io.out.valid := v
-  io.out.bits.vpn := next_line
-  io.out.bits.source := prefetchID.U
+  io.out.bits.req_info.vpn := next_req
+  io.out.bits.req_info.s2xlate := s2xlate
+  io.out.bits.req_info.source := prefetchID.U
+  io.out.bits.isHptwReq := false.B
+  io.out.bits.isLLptw := false.B
+  io.out.bits.hptwId := DontCare
+
+  when (io.out.fire) {
+    old_v(old_index) := true.B
+    old_reqs(old_index) := next_req
+    old_index := Mux((old_index === (OldRecordSize-1).U), 0.U, old_index + 1.U)
+  }
+
+  when (flush) {
+    old_v.map(_ := false.B)
+  }
+
+  XSPerfAccumulate("l2tlb_prefetch_input_count", io.in.valid)
+  XSPerfAccumulate("l2tlb_prefetch_valid_count", input_valid)
+  XSPerfAccumulate("l2tlb_prefetch_output_count", io.out.fire)
 }

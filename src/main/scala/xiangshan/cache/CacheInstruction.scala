@@ -4,8 +4,8 @@ import chisel3._
 import chisel3.util._
 import xiangshan._
 import xiangshan.frontend.icache._
-import utils._
-import chipsalliance.rocketchip.config.Parameters
+import utility._
+import org.chipsalliance.cde.config.Parameters
 import xiangshan.backend.fu.util.HasCSRConst
 
 object CacheOpMap{
@@ -18,8 +18,8 @@ object CacheOpMap{
   }
 }
 
-object CacheRegMap{ 
-  def apply(offset: String,  width: String, authority: String, name: String ): Pair[String, Map[String, String]] = {
+object CacheRegMap{
+  def apply(offset: String,  width: String, authority: String, name: String ): (String, Map[String, String]) = {
     name -> Map(
       "offset" -> offset,
       "width"  -> width,
@@ -32,7 +32,7 @@ trait CacheControlConst{
   def maxDataRowSupport = 8
 }
 
-abstract class CacheCtrlModule(implicit p: Parameters) extends XSModule with HasCSRConst with CacheControlConst
+abstract class CacheCtrlModule(implicit p: Parameters) extends XSModule with HasCSRConst with CacheControlConst with HasDCacheParameters
 
 object CacheInstrucion{
   def CacheOperation = List(
@@ -141,20 +141,23 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
   val io = IO(new Bundle {
     val csr = new L1CacheToCsrIO
     val cache = new L1CacheInnerOpIO
-    val error = Flipped(new L1CacheErrorInfo)
+    val cache_req_dup = Vec(DCacheDupNum, Valid(new CacheCtrlReqInfo))
+    val cacheOp_req_bits_opCode_dup = Output(Vec(DCacheDupNum, UInt(XLEN.W)))
+    val error = Flipped(ValidIO(new L1CacheErrorInfo))
   })
 
   // CSRCacheOpDecoder state
-  val wait_csr_op_req = RegInit(true.B) // waiting for csr "CACHE_OP" being write  
+  val wait_csr_op_req = RegInit(true.B) // waiting for csr "CACHE_OP" being write
   val wait_cache_op_resp = RegInit(false.B) // waiting for dcache to finish dcache op
-  val schedule_csr_op_resp_data = RegInit(false.B) // ready to write data readed from cache back to csr  
-  val schedule_csr_op_resp_finish = RegInit(false.B) // ready to write "OP_FINISH" csr 
+  val schedule_csr_op_resp_data = RegInit(false.B) // ready to write data readed from cache back to csr
+  val schedule_csr_op_resp_finish = RegInit(false.B) // ready to write "OP_FINISH" csr
   // val cache_op_resp_timer = RegInit(0.U(4.W))
   val data_transfer_finished = WireInit(false.B)
   val data_transfer_cnt = RegInit(0.U(log2Up(maxDataRowSupport).W))
 
   // Translate CSR write to cache op
   val translated_cache_req = Reg(new CacheCtrlReqInfo)
+  val translated_cache_req_opCode_dup = Reg(Vec(DCacheDupNum, UInt(XLEN.W)))
   println("Cache op decoder (" + decoder_name + "):")
   println("  Id " + id)
   // CacheInsRegisterList.map{case (name, attribute) => {
@@ -176,6 +179,7 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
   }
 
   update_cache_req_when_write("CACHE_OP", translated_cache_req.opCode)
+  translated_cache_req_opCode_dup.map(dup => update_cache_req_when_write("CACHE_OP", dup))
   update_cache_req_when_write("CACHE_LEVEL", translated_cache_req.level)
   update_cache_req_when_write("CACHE_WAY", translated_cache_req.wayNum)
   update_cache_req_when_write("CACHE_IDX", translated_cache_req.index)
@@ -200,14 +204,18 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
 
   // Send cache op to cache
   io.cache.req.valid := RegNext(cache_op_start)
+  io.cache_req_dup.map( dup => dup.valid := RegNext(cache_op_start) )
   io.cache.req.bits := translated_cache_req
-  when(io.cache.req.fire()){
+  io.cache_req_dup.map( dup => dup.bits := translated_cache_req )
+  when(io.cache.req.fire){
     wait_cache_op_resp := true.B
   }
 
+  io.cacheOp_req_bits_opCode_dup.zipWithIndex.map{ case (dup, i) => dup := translated_cache_req_opCode_dup(i) }
+
   // Receive cache op resp from cache
   val raw_cache_resp = Reg(new CacheCtrlRespInfo)
-  when(io.cache.resp.fire()){
+  when(io.cache.resp.fire){
     wait_cache_op_resp := false.B
     raw_cache_resp := io.cache.resp.bits
     when(CacheInstrucion.isReadOp(translated_cache_req.opCode)){
@@ -221,11 +229,11 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
   }
 
   // Translate cache op resp to CSR write, send it back to CSR
-  when(io.csr.update.w.fire() && schedule_csr_op_resp_data && data_transfer_finished){
+  when(io.csr.update.w.fire && schedule_csr_op_resp_data && data_transfer_finished){
     schedule_csr_op_resp_data := false.B
     schedule_csr_op_resp_finish := true.B
   }
-  when(io.csr.update.w.fire() && schedule_csr_op_resp_finish){
+  when(io.csr.update.w.fire && schedule_csr_op_resp_finish){
     schedule_csr_op_resp_finish := false.B
     wait_csr_op_req := true.B
   }
@@ -233,8 +241,8 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
   io.csr.update.w.valid := schedule_csr_op_resp_data || schedule_csr_op_resp_finish
   io.csr.update.w.bits := DontCare
 
-  val isReadTagECC = WireInit(CacheInstrucion.isReadTagECC(translated_cache_req.opCode))
-  val isReadDataECC = WireInit(CacheInstrucion.isReadDataECC(translated_cache_req.opCode))
+  val isReadTagECC = WireInit(CacheInstrucion.isReadTagECC(translated_cache_req_opCode_dup(0)))
+  val isReadDataECC = WireInit(CacheInstrucion.isReadDataECC(translated_cache_req_opCode_dup(0)))
   val isReadTag = WireInit(CacheInstrucion.isReadTag(translated_cache_req.opCode))
   val isReadData = WireInit(CacheInstrucion.isReadData(translated_cache_req.opCode))
 
@@ -243,7 +251,7 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
       isReadTagECC -> (CacheInstrucion.CacheInsRegisterList("CACHE_TAG_ECC")("offset").toInt + Scachebase).U,
       isReadDataECC -> (CacheInstrucion.CacheInsRegisterList("CACHE_DATA_ECC")("offset").toInt + Scachebase).U,
       isReadTag -> ((CacheInstrucion.CacheInsRegisterList("CACHE_TAG_LOW")("offset").toInt + Scachebase).U + data_transfer_cnt),
-      isReadData -> ((CacheInstrucion.CacheInsRegisterList("CACHE_DATA_0")("offset").toInt + Scachebase).U + data_transfer_cnt), 
+      isReadData -> ((CacheInstrucion.CacheInsRegisterList("CACHE_DATA_0")("offset").toInt + Scachebase).U + data_transfer_cnt),
     ))
     io.csr.update.w.bits.data := Mux1H(List(
       isReadTagECC -> raw_cache_resp.read_tag_ecc,
@@ -264,8 +272,8 @@ class CSRCacheOpDecoder(decoder_name: String, id: Int)(implicit p: Parameters) e
     data_transfer_cnt := 0.U
   }
 
-  val error = DelayN(io.error, 1)
-  when(error.report_to_beu) {
+  val error = DelayNWithValid(io.error, 1)
+  when(error.bits.report_to_beu && error.valid) {
     io.csr.update.w.bits.addr := (CacheInstrucion.CacheInsRegisterList("CACHE_ERROR")("offset").toInt + Scachebase).U
     io.csr.update.w.bits.data := error.asUInt
     io.csr.update.w.valid := true.B
@@ -282,20 +290,20 @@ class CSRCacheErrorDecoder(implicit p: Parameters) extends CacheCtrlModule {
       printf("  " + desc + "\n")
     }
   }
-  val decoded_cache_error = WireInit(encoded_cache_error.asTypeOf(new L1CacheErrorInfo))
+  val decoded_cache_error = WireInit(encoded_cache_error.asTypeOf(ValidIO(new L1CacheErrorInfo)))
   when(decoded_cache_error.valid && !RegNext(decoded_cache_error.valid)){
     printf("CACHE_ERROR CSR reported an error:\n")
-    printf("  paddr 0x%x\n", decoded_cache_error.paddr)
-    print_cache_error_flag(decoded_cache_error.report_to_beu, "report to bus error unit")
-    print_cache_error_flag(decoded_cache_error.source.tag, "tag")
-    print_cache_error_flag(decoded_cache_error.source.data, "data")
-    print_cache_error_flag(decoded_cache_error.source.l2, "l2")
-    print_cache_error_flag(decoded_cache_error.opType.fetch, "fetch")
-    print_cache_error_flag(decoded_cache_error.opType.load, "load")
-    print_cache_error_flag(decoded_cache_error.opType.store, "store")
-    print_cache_error_flag(decoded_cache_error.opType.probe, "probe")
-    print_cache_error_flag(decoded_cache_error.opType.release, "release")
-    print_cache_error_flag(decoded_cache_error.opType.atom, "atom")
+    printf("  paddr 0x%x\n", decoded_cache_error.bits.paddr)
+    print_cache_error_flag(decoded_cache_error.bits.report_to_beu, "report to bus error unit")
+    print_cache_error_flag(decoded_cache_error.bits.source.tag, "tag")
+    print_cache_error_flag(decoded_cache_error.bits.source.data, "data")
+    print_cache_error_flag(decoded_cache_error.bits.source.l2, "l2")
+    print_cache_error_flag(decoded_cache_error.bits.opType.fetch, "fetch")
+    print_cache_error_flag(decoded_cache_error.bits.opType.load, "load")
+    print_cache_error_flag(decoded_cache_error.bits.opType.store, "store")
+    print_cache_error_flag(decoded_cache_error.bits.opType.probe, "probe")
+    print_cache_error_flag(decoded_cache_error.bits.opType.release, "release")
+    print_cache_error_flag(decoded_cache_error.bits.opType.atom, "atom")
     printf("It should not happen in normal execution flow\n")
   }
 }

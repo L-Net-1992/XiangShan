@@ -12,51 +12,31 @@
 * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 *
 * See the Mulan PSL v2 for more details.
+*
+*
+* Acknowledgement
+*
+* This implementation is inspired by several key papers:
+* [1] Andrew D. Booth. "[A signed binary multiplication technique.](https://doi.org/10.1093/qjmam/4.2.236)" The
+* Quarterly Journal of Mechanics and Applied Mathematics 4.2: 236-240. 1951.
+* [2] Christopher. S. Wallace. "[A suggestion for a fast multiplier.](https://doi.org/10.1109/PGEC.1964.263830)" IEEE
+* Transactions on Electronic Computers 1: 14-17. 1964.
 ***************************************************************************************/
 
 package xiangshan.backend.fu
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import xiangshan._
+import utility._
 import utils._
+import xiangshan._
 import xiangshan.backend.fu.util.{C22, C32, C53}
 
 class MulDivCtrl extends Bundle{
   val sign = Bool()
   val isW = Bool()
   val isHi = Bool() // return hi bits of result ?
-}
-
-class AbstractMultiplier(len: Int)(implicit p: Parameters) extends FunctionUnit(
-  len
-){
-  val ctrl = IO(Input(new MulDivCtrl))
-}
-
-class NaiveMultiplier(len: Int, val latency: Int)(implicit p: Parameters)
-  extends AbstractMultiplier(len)
-  with HasPipelineReg
-{
-
-  val (src1, src2) = (io.in.bits.src(0), io.in.bits.src(1))
-
-  val mulRes = src1.asSInt() * src2.asSInt()
-
-  var dataVec = Seq(mulRes.asUInt())
-  var ctrlVec = Seq(ctrl)
-
-  for(i <- 1 to latency){
-    dataVec = dataVec :+ PipelineReg(i)(dataVec(i-1))
-    ctrlVec = ctrlVec :+ PipelineReg(i)(ctrlVec(i-1))
-  }
-
-  val xlen = io.out.bits.data.getWidth
-  val res = Mux(ctrlVec.last.isHi, dataVec.last(2*xlen-1, xlen), dataVec.last(xlen-1,0))
-  io.out.bits.data := Mux(ctrlVec.last.isW, SignExt(res(31,0),xlen), res)
-
-  XSDebug(p"validVec:${Binary(Cat(validVec))} flushVec:${Binary(Cat(flushVec))}\n")
 }
 
 class ArrayMulDataModule(len: Int) extends Module {
@@ -70,7 +50,7 @@ class ArrayMulDataModule(len: Int) extends Module {
   val b_sext, bx2, neg_b, neg_bx2 = Wire(UInt((len+1).W))
   b_sext := SignExt(b, len+1)
   bx2 := b_sext << 1
-  neg_b := (~b_sext).asUInt()
+  neg_b := (~b_sext).asUInt
   neg_bx2 := neg_b << 1
 
   val columns: Array[Seq[Bool]] = Array.fill(2*len)(Seq())
@@ -78,7 +58,7 @@ class ArrayMulDataModule(len: Int) extends Module {
   var last_x = WireInit(0.U(3.W))
   for(i <- Range(0, len, 2)){
     val x = if(i==0) Cat(a(1,0), 0.U(1.W)) else if(i+1==len) SignExt(a(i, i-1), 3) else a(i+1, i-1)
-    val pp_temp = MuxLookup(x, 0.U, Seq(
+    val pp_temp = MuxLookup(x, 0.U)(Seq(
       1.U -> b_sext,
       2.U -> b_sext,
       3.U -> bx2,
@@ -87,7 +67,7 @@ class ArrayMulDataModule(len: Int) extends Module {
       6.U -> neg_b
     ))
     val s = pp_temp(len)
-    val t = MuxLookup(last_x, 0.U(2.W), Seq(
+    val t = MuxLookup(last_x, 0.U(2.W))(Seq(
       4.U -> 2.U(2.W),
       5.U -> 1.U(2.W),
       6.U -> 1.U(2.W)
@@ -118,22 +98,22 @@ class ArrayMulDataModule(len: Int) extends Module {
       case 2 =>
         val c22 = Module(new C22)
         c22.io.in := col
-        sum = c22.io.out(0).asBool() +: cin
-        cout2 = Seq(c22.io.out(1).asBool())
+        sum = c22.io.out(0).asBool +: cin
+        cout2 = Seq(c22.io.out(1).asBool)
       case 3 =>
         val c32 = Module(new C32)
         c32.io.in := col
-        sum = c32.io.out(0).asBool() +: cin
-        cout2 = Seq(c32.io.out(1).asBool())
+        sum = c32.io.out(0).asBool +: cin
+        cout2 = Seq(c32.io.out(1).asBool)
       case 4 =>
         val c53 = Module(new C53)
         for((x, y) <- c53.io.in.take(4) zip col){
           x := y
         }
         c53.io.in.last := (if(cin.nonEmpty) cin.head else 0.U)
-        sum = Seq(c53.io.out(0).asBool()) ++ (if(cin.nonEmpty) cin.drop(1) else Nil)
-        cout1 = Seq(c53.io.out(1).asBool())
-        cout2 = Seq(c53.io.out(2).asBool())
+        sum = Seq(c53.io.out(0).asBool) ++ (if(cin.nonEmpty) cin.drop(1) else Nil)
+        cout1 = Seq(c53.io.out(1).asBool)
+        cout2 = Seq(c53.io.out(2).asBool)
       case n =>
         val cin_1 = if(cin.nonEmpty) Seq(cin.head) else Nil
         val cin_2 = if(cin.nonEmpty) cin.drop(1) else Nil
@@ -147,7 +127,7 @@ class ArrayMulDataModule(len: Int) extends Module {
   }
 
   def max(in: Iterable[Int]): Int = in.reduce((a, b) => if(a>b) a else b)
-  def addAll(cols: Array[Seq[Bool]], depth: Int): (UInt, UInt) = {
+  def addAll(cols: Seq[Seq[Bool]], depth: Int): (UInt, UInt) = {
     if(max(cols.map(_.size)) <= 2){
       val sum = Cat(cols.map(_(0)).reverse)
       var k = 0
@@ -170,35 +150,12 @@ class ArrayMulDataModule(len: Int) extends Module {
       else
         columns_next
 
-      addAll(toNextLayer, depth+1)
+      addAll(toNextLayer.toSeq, depth+1)
     }
   }
 
   val columns_reg = columns.map(col => col.map(b => RegEnable(b, io.regEnables(0))))
-  val (sum, carry) = addAll(cols = columns_reg, depth = 0)
+  val (sum, carry) = addAll(cols = columns_reg.toSeq, depth = 0)
 
   io.result := sum + carry
-}
-
-class ArrayMultiplier(len: Int)(implicit p: Parameters)
-  extends AbstractMultiplier(len) with HasPipelineReg {
-
-  override def latency = 2
-
-  val mulDataModule = Module(new ArrayMulDataModule(len))
-  mulDataModule.io.a := io.in.bits.src(0)
-  mulDataModule.io.b := io.in.bits.src(1)
-  mulDataModule.io.regEnables := VecInit((1 to latency) map (i => regEnable(i)))
-  val result = mulDataModule.io.result
-
-  var ctrlVec = Seq(ctrl)
-  for(i <- 1 to latency){
-    ctrlVec = ctrlVec :+ PipelineReg(i)(ctrlVec(i-1))
-  }
-  val xlen = len - 1
-  val res = Mux(ctrlVec.last.isHi, result(2*xlen-1, xlen), result(xlen-1,0))
-
-  io.out.bits.data := Mux(ctrlVec.last.isW, SignExt(res(31,0),xlen), res)
-
-  XSDebug(p"validVec:${Binary(Cat(validVec))} flushVec:${Binary(Cat(flushVec))}\n")
 }

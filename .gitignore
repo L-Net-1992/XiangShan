@@ -358,7 +358,13 @@ simv.daidir
 ucli.key
 stack.info*
 *.vpd
+*.vcd
 *.bin
 
 !ready-to-run/*
 
+# Log files
+simulator_err.txt
+simulator_out.txt
+*.log
+*.err

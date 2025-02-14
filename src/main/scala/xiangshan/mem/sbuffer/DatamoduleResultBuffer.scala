@@ -16,12 +16,14 @@
 
 package xiangshan.mem
 
-import chipsalliance.rocketchip.config.Parameters
-import chisel3.experimental.{DataMirror, requireIsChiselType}
+import org.chipsalliance.cde.config.Parameters
+import chisel3.experimental.requireIsChiselType
+import chisel3.reflect.DataMirror
 import chisel3._
 import chisel3.util._
 import xiangshan._
 import utils._
+import utility._
 import xiangshan.cache._
 import difftest._
 
@@ -38,15 +40,9 @@ class DatamoduleResultBuffer[T <: Data]
   gen: T,
 )(implicit p: Parameters) extends XSModule {
 
-  val genType = if (compileOptions.declaredTypeMustBeUnbound) {
+  val genType = {
     requireIsChiselType(gen)
     gen
-  } else {
-    if (DataMirror.internal.isSynthesizable(gen)) {
-      chiselTypeOf(gen)
-    } else {
-      gen
-    }
   }
 
   val io = IO(new DatamoduleResultBufferIO[T](gen))
@@ -81,7 +77,7 @@ class DatamoduleResultBuffer[T <: Data]
     assert(!(io.enq(i).valid && !io.enq(i - 1).valid))
   })
 
-  (0 until EnsbufferWidth).foreach(index => 
+  (0 until EnsbufferWidth).foreach(index =>
     when(io.deq(index).fire) {
       valids(deq_flag + index.U) := 0.B
       if (EnsbufferWidth > 1) deq_flag := deq_flag + index.U + 1.U

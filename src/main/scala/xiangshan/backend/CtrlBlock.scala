@@ -1,494 +1,994 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
-* Copyright (c) 2020-2021 Peng Cheng Laboratory
-*
-* XiangShan is licensed under Mulan PSL v2.
-* You can use this software according to the terms and conditions of the Mulan PSL v2.
-* You may obtain a copy of Mulan PSL v2 at:
-*          http://license.coscl.org.cn/MulanPSL2
-*
-* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
-* EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
-* MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
-*
-* See the Mulan PSL v2 for more details.
-***************************************************************************************/
+ * Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+ * Copyright (c) 2020-2021 Peng Cheng Laboratory
+ *
+ * XiangShan is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ *
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ *
+ * See the Mulan PSL v2 for more details.
+ ***************************************************************************************/
 
 package xiangshan.backend
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import difftest._
 import freechips.rocketchip.diplomacy.{LazyModule, LazyModuleImp}
+import utility._
 import utils._
+import xiangshan.ExceptionNO._
 import xiangshan._
-import xiangshan.backend.decode.{DecodeStage, ImmUnion}
-import xiangshan.backend.dispatch.{Dispatch, DispatchQueue}
+import xiangshan.backend.Bundles.{DecodedInst, DynInst, ExceptionInfo, ExuOutput, ExuVec, StaticInst, TrapInstInfo}
+import xiangshan.backend.ctrlblock.{DebugLSIO, DebugLsInfoBundle, LsTopdownInfo, MemCtrl, RedirectGenerator}
+import xiangshan.backend.datapath.DataConfig.{FpData, IntData, V0Data, VAddrData, VecData, VlData}
+import xiangshan.backend.decode.{DecodeStage, FusionDecoder}
+import xiangshan.backend.dispatch.{CoreDispatchTopDownIO, Dispatch, DispatchQueue}
+import xiangshan.backend.dispatch.NewDispatch
 import xiangshan.backend.fu.PFEvent
-import xiangshan.backend.rename.{Rename, RenameTableWrapper}
-import xiangshan.backend.rob.{Rob, RobCSRIO, RobLsqIO}
-import xiangshan.frontend.FtqRead
-import xiangshan.mem.mdp.{LFST, SSIT, WaitTable}
+import xiangshan.backend.fu.vector.Bundles.{VType, Vl}
+import xiangshan.backend.fu.wrapper.CSRToDecode
+import xiangshan.backend.rename.{Rename, RenameTableWrapper, SnapshotGenerator}
+import xiangshan.backend.rob.{Rob, RobCSRIO, RobCoreTopDownIO, RobDebugRollingIO, RobLsqIO, RobPtr}
+import xiangshan.frontend.{FtqPtr, FtqRead, Ftq_RF_Components}
+import xiangshan.mem.{LqPtr, LsqEnqIO, SqPtr}
+import xiangshan.backend.issue.{FpScheduler, IntScheduler, MemScheduler, VfScheduler}
+import xiangshan.backend.trace._
 
 class CtrlToFtqIO(implicit p: Parameters) extends XSBundle {
-  def numRedirect = exuParameters.JmpCnt + exuParameters.AluCnt
   val rob_commits = Vec(CommitWidth, Valid(new RobCommitInfo))
   val redirect = Valid(new Redirect)
-  val for_redirect_gen = new Bundle {
-    val rawRedirect = Valid(new Redirect)
-    val s1_redirect_onehot = Output(Vec(numRedirect+1, Bool()))
-    val s1_oldest_redirect = ValidIO(new Redirect)
-    val s1_oldest_exu_output = ValidIO(new ExuOutput)
-    val s1_jumpTarget = Output(UInt(VAddrBits.W))
-    val flushRedirect = Valid(new Redirect)
-    val frontendFlushTarget = Output(UInt(VAddrBits.W))
-  }
+  val ftqIdxAhead = Vec(BackendRedirectNum, Valid(new FtqPtr))
+  val ftqIdxSelOH = Valid(UInt((BackendRedirectNum).W))
 }
 
-class RedirectGenerator(implicit p: Parameters) extends XSModule
-  with HasCircularQueuePtrHelper {
+class CtrlBlock(params: BackendParams)(implicit p: Parameters) extends LazyModule {
+  override def shouldBeInlined: Boolean = false
 
-  class RedirectGeneratorIO(implicit p: Parameters) extends XSBundle {
-    def numRedirect = exuParameters.JmpCnt + exuParameters.AluCnt
-    val hartId = Input(UInt(8.W))
-    val exuMispredict = Vec(numRedirect, Flipped(ValidIO(new ExuOutput)))
-    val loadReplay = Flipped(ValidIO(new Redirect))
-    val flush = Input(Bool())
-    val stage1PcRead = Vec(numRedirect+1, new FtqRead(UInt(VAddrBits.W)))
-    val stage2Redirect = ValidIO(new Redirect)
-    val stage3Redirect = ValidIO(new Redirect)
-    val memPredUpdate = Output(new MemPredUpdateReq)
-    val memPredPcRead = new FtqRead(UInt(VAddrBits.W)) // read req send form stage 2
-    val for_frontend_redirect_gen = new Bundle {
-      val s1_jumpTarget = Output(UInt(VAddrBits.W))
-      val s1_redirect_onehot = Output(Vec(numRedirect+1, Bool()))
-      val s1_oldest_redirect = ValidIO(new Redirect)
-      val s1_oldest_exu_output = ValidIO(new ExuOutput)
-      val s1_real_pc = Input(UInt(VAddrBits.W))
-    }
-  }
-  val io = IO(new RedirectGeneratorIO)
-  /*
-        LoadQueue  Jump  ALU0  ALU1  ALU2  ALU3   exception    Stage1
-          |         |      |    |     |     |         |
-          |============= reg & compare =====|         |       ========
-                            |                         |
-                            |                         |
-                            |                         |        Stage2
-                            |                         |
-                    redirect (flush backend)          |
-                    |                                 |
-               === reg ===                            |       ========
-                    |                                 |
-                    |----- mux (exception first) -----|        Stage3
-                            |
-                redirect (send to frontend)
-   */
-  private class Wrapper(val n: Int) extends Bundle {
-    val redirect = new Redirect
-    val valid = Bool()
-    val idx = UInt(log2Up(n).W)
-  }
-  def selectOldestRedirect(xs: Seq[Valid[Redirect]]): Vec[Bool] = {
-    val compareVec = (0 until xs.length).map(i => (0 until i).map(j => isAfter(xs(j).bits.robIdx, xs(i).bits.robIdx)))
-    val resultOnehot = VecInit((0 until xs.length).map(i => Cat((0 until xs.length).map(j =>
-      (if (j < i) !xs(j).valid || compareVec(i)(j)
-      else if (j == i) xs(i).valid
-      else !xs(j).valid || !compareVec(j)(i))
-    )).andR))
-    resultOnehot
-  }
+  val rob = LazyModule(new Rob(params))
 
-  val redirects = io.exuMispredict.map(_.bits.redirect) :+ io.loadReplay.bits
-  val stage1FtqReadPcs =
-    (io.stage1PcRead zip redirects).map{ case (r, redirect) =>
-      r(redirect.ftqIdx, redirect.ftqOffset)
-    }
+  lazy val module = new CtrlBlockImp(this)(p, params)
 
-  def getRedirect(exuOut: Valid[ExuOutput]): ValidIO[Redirect] = {
-    val redirect = Wire(Valid(new Redirect))
-    redirect.valid := exuOut.valid && exuOut.bits.redirect.cfiUpdate.isMisPred
-    redirect.bits := exuOut.bits.redirect
-    redirect
-  }
-
-  val jumpOut = io.exuMispredict.head
-  val allRedirect = VecInit(io.exuMispredict.map(x => getRedirect(x)) :+ io.loadReplay)
-  val oldestOneHot = selectOldestRedirect(allRedirect)
-  val needFlushVec = VecInit(allRedirect.map(_.bits.robIdx.needFlush(io.stage2Redirect) || io.flush))
-  val oldestValid = VecInit(oldestOneHot.zip(needFlushVec).map{ case (v, f) => v && !f }).asUInt.orR
-  val oldestExuOutput = Mux1H(io.exuMispredict.indices.map(oldestOneHot), io.exuMispredict)
-  val oldestRedirect = Mux1H(oldestOneHot, allRedirect)
-
-  val s1_jumpTarget = RegEnable(jumpOut.bits.redirect.cfiUpdate.target, jumpOut.valid)
-  val s1_imm12_reg = RegNext(oldestExuOutput.bits.uop.ctrl.imm(11, 0))
-  val s1_pd = RegNext(oldestExuOutput.bits.uop.cf.pd)
-  val s1_redirect_bits_reg = RegNext(oldestRedirect.bits)
-  val s1_redirect_valid_reg = RegNext(oldestValid)
-  val s1_redirect_onehot = RegNext(oldestOneHot)
-  io.for_frontend_redirect_gen.s1_jumpTarget := s1_jumpTarget
-  io.for_frontend_redirect_gen.s1_redirect_onehot := s1_redirect_onehot
-  io.for_frontend_redirect_gen.s1_oldest_redirect.valid := s1_redirect_valid_reg
-  io.for_frontend_redirect_gen.s1_oldest_redirect.bits := s1_redirect_bits_reg
-  io.for_frontend_redirect_gen.s1_oldest_exu_output := RegNext(oldestExuOutput)
-
-  // stage1 -> stage2
-  io.stage2Redirect.valid := s1_redirect_valid_reg && !io.flush
-  io.stage2Redirect.bits := s1_redirect_bits_reg
-
-  val s1_isReplay = s1_redirect_onehot.last
-  val s1_isJump = s1_redirect_onehot.head
-  val real_pc = Mux1H(s1_redirect_onehot, stage1FtqReadPcs)
-  val brTarget = real_pc + SignExt(ImmUnion.B.toImm32(s1_imm12_reg), XLEN)
-  val snpc = real_pc + Mux(s1_pd.isRVC, 2.U, 4.U)
-  val target = Mux(s1_isReplay,
-    real_pc, // replay from itself
-    Mux(s1_redirect_bits_reg.cfiUpdate.taken,
-      Mux(s1_isJump, s1_jumpTarget, brTarget),
-      snpc
-    )
-  )
-
-  val stage2CfiUpdate = io.stage2Redirect.bits.cfiUpdate
-  stage2CfiUpdate.pc := real_pc
-  stage2CfiUpdate.pd := s1_pd
-  // stage2CfiUpdate.predTaken := s1_redirect_bits_reg.cfiUpdate.predTaken
-  stage2CfiUpdate.target := target
-  // stage2CfiUpdate.taken := s1_redirect_bits_reg.cfiUpdate.taken
-  // stage2CfiUpdate.isMisPred := s1_redirect_bits_reg.cfiUpdate.isMisPred
-
-  val s2_target = RegEnable(target, s1_redirect_valid_reg)
-  val s2_pc = RegEnable(real_pc, s1_redirect_valid_reg)
-  val s2_redirect_bits_reg = RegEnable(s1_redirect_bits_reg, s1_redirect_valid_reg)
-  val s2_redirect_valid_reg = RegNext(s1_redirect_valid_reg && !io.flush, init = false.B)
-
-  io.stage3Redirect.valid := s2_redirect_valid_reg
-  io.stage3Redirect.bits := s2_redirect_bits_reg
-
-  // get pc from ftq
-  // valid only if redirect is caused by load violation
-  // store_pc is used to update store set
-  val store_pc = io.memPredPcRead(s1_redirect_bits_reg.stFtqIdx, s1_redirect_bits_reg.stFtqOffset)
-
-  val s1_real_pc_from_frontend = io.for_frontend_redirect_gen.s1_real_pc
-  // update load violation predictor if load violation redirect triggered
-  io.memPredUpdate.valid := RegNext(s1_isReplay && s1_redirect_valid_reg, init = false.B)
-  // update wait table
-  io.memPredUpdate.waddr := RegNext(XORFold(s1_real_pc_from_frontend(VAddrBits-1, 1), MemPredPCWidth))
-  io.memPredUpdate.wdata := true.B
-  // update store set
-  io.memPredUpdate.ldpc := RegNext(XORFold(s1_real_pc_from_frontend(VAddrBits-1, 1), MemPredPCWidth))
-  // store pc is ready 1 cycle after s1_isReplay is judged
-  io.memPredUpdate.stpc := XORFold(store_pc(VAddrBits-1, 1), MemPredPCWidth)
-
-  XSError(io.memPredUpdate.valid && RegNext(s1_real_pc_from_frontend) =/= RegNext(real_pc), "s1_real_pc error")
-
-  // // recover runahead checkpoint if redirect
-  // if (!env.FPGAPlatform) {
-  //   val runahead_redirect = Module(new DifftestRunaheadRedirectEvent)
-  //   runahead_redirect.io.clock := clock
-  //   runahead_redirect.io.coreid := io.hartId
-  //   runahead_redirect.io.valid := io.stage3Redirect.valid
-  //   runahead_redirect.io.pc :=  s2_pc // for debug only
-  //   runahead_redirect.io.target_pc := s2_target // for debug only
-  //   runahead_redirect.io.checkpoint_id := io.stage3Redirect.bits.debug_runahead_checkpoint_id // make sure it is right
-  // }
+  val gpaMem = LazyModule(new GPAMem())
 }
 
-class CtrlBlock(implicit p: Parameters) extends LazyModule
-  with HasWritebackSink with HasWritebackSource {
-  val rob = LazyModule(new Rob)
-
-  override def addWritebackSink(source: Seq[HasWritebackSource], index: Option[Seq[Int]]): HasWritebackSink = {
-    rob.addWritebackSink(Seq(this), Some(Seq(writebackSinks.length)))
-    super.addWritebackSink(source, index)
-  }
-
-  lazy val module = new CtrlBlockImp(this)
-
-  override lazy val writebackSourceParams: Seq[WritebackSourceParams] = {
-    writebackSinksParams
-  }
-  override lazy val writebackSourceImp: HasWritebackSourceImp = module
-
-  override def generateWritebackIO(
-    thisMod: Option[HasWritebackSource] = None,
-    thisModImp: Option[HasWritebackSourceImp] = None
-  ): Unit = {
-    module.io.writeback.zip(writebackSinksImp(thisMod, thisModImp)).foreach(x => x._1 := x._2)
-  }
-}
-
-class CtrlBlockImp(outer: CtrlBlock)(implicit p: Parameters) extends LazyModuleImp(outer)
+class CtrlBlockImp(
+  override val wrapper: CtrlBlock
+)(implicit
+  p: Parameters,
+  params: BackendParams
+) extends LazyModuleImp(wrapper)
   with HasXSParameter
   with HasCircularQueuePtrHelper
-  with HasWritebackSourceImp
   with HasPerfEvents
+  with HasCriticalErrors
 {
-  val writebackLengths = outer.writebackSinksParams.map(_.length)
+  val pcMemRdIndexes = new NamedIndexes(Seq(
+    "redirect"  -> 1,
+    "memPred"   -> 1,
+    "robFlush"  -> 1,
+    "bjuPc"     -> params.BrhCnt,
+    "bjuTarget" -> params.BrhCnt,
+    "load"      -> params.LduCnt,
+    "hybrid"    -> params.HyuCnt,
+    "store"     -> (if(EnableStorePrefetchSMS) params.StaCnt else 0),
+    "trace"     -> TraceGroupNum
+  ))
 
-  val io = IO(new Bundle {
-    val hartId = Input(UInt(8.W))
-    val cpu_halt = Output(Bool())
-    val frontend = Flipped(new FrontendToCtrlIO)
-    val allocPregs = Vec(RenameWidth, Output(new ResetPregStateReq))
-    val dispatch = Vec(3*dpParams.IntDqDeqWidth, DecoupledIO(new MicroOp))
-    // from int block
-    val exuRedirect = Vec(exuParameters.AluCnt + exuParameters.JmpCnt, Flipped(ValidIO(new ExuOutput)))
-    val stIn = Vec(exuParameters.StuCnt, Flipped(ValidIO(new ExuInput)))
-    val memoryViolation = Flipped(ValidIO(new Redirect))
-    val jumpPc = Output(UInt(VAddrBits.W))
-    val jalr_target = Output(UInt(VAddrBits.W))
-    val robio = new Bundle {
-      // to int block
-      val toCSR = new RobCSRIO
-      val exception = ValidIO(new ExceptionInfo)
-      // to mem block
-      val lsq = new RobLsqIO
-    }
-    val csrCtrl = Input(new CustomCSRCtrlIO)
-    val perfInfo = Output(new Bundle{
-      val ctrlInfo = new Bundle {
-        val robFull   = Input(Bool())
-        val intdqFull = Input(Bool())
-        val fpdqFull  = Input(Bool())
-        val lsdqFull  = Input(Bool())
-      }
-    })
-    val writeback = MixedVec(writebackLengths.map(num => Vec(num, Flipped(ValidIO(new ExuOutput)))))
-    // redirect out
-    val redirect = ValidIO(new Redirect)
-    val debug_int_rat = Vec(32, Output(UInt(PhyRegIdxWidth.W)))
-    val debug_fp_rat = Vec(32, Output(UInt(PhyRegIdxWidth.W)))
-  })
+  private val numPcMemReadForExu = params.numPcReadPort
+  private val numPcMemRead = pcMemRdIndexes.maxIdx
 
-  override def writebackSource: Option[Seq[Seq[Valid[ExuOutput]]]] = {
-    Some(io.writeback.map(writeback => {
-      val exuOutput = WireInit(writeback)
-      val timer = GTimer()
-      for ((wb_next, wb) <- exuOutput.zip(writeback)) {
-        wb_next.valid := RegNext(wb.valid && !wb.bits.uop.robIdx.needFlush(stage2Redirect))
-        wb_next.bits := RegNext(wb.bits)
-        wb_next.bits.uop.debugInfo.writebackTime := timer
-      }
-      exuOutput
-    }))
+  // now pcMem read for exu is moved to PcTargetMem (OG0)
+  println(s"pcMem read num: $numPcMemRead")
+  println(s"pcMem read num for exu: $numPcMemReadForExu")
+
+  val io = IO(new CtrlBlockIO())
+
+  val dispatch = Module(new NewDispatch)
+  val gpaMem = wrapper.gpaMem.module
+  val decode = Module(new DecodeStage)
+  val fusionDecoder = Module(new FusionDecoder)
+  val rat = Module(new RenameTableWrapper)
+  val rename = Module(new Rename)
+  val redirectGen = Module(new RedirectGenerator)
+  private def hasRen: Boolean = true
+  private val pcMem = Module(new SyncDataModuleTemplate(new Ftq_RF_Components, FtqSize, numPcMemRead, 1, "BackendPC", hasRen = hasRen))
+  private val rob = wrapper.rob.module
+  private val memCtrl = Module(new MemCtrl(params))
+
+  private val disableFusion = decode.io.csrCtrl.singlestep || !decode.io.csrCtrl.fusion_enable
+
+  private val s0_robFlushRedirect = rob.io.flushOut
+  private val s1_robFlushRedirect = Wire(Valid(new Redirect))
+  s1_robFlushRedirect.valid := GatedValidRegNext(s0_robFlushRedirect.valid, false.B)
+  s1_robFlushRedirect.bits := RegEnable(s0_robFlushRedirect.bits, s0_robFlushRedirect.valid)
+
+  pcMem.io.ren.get(pcMemRdIndexes("robFlush").head) := s0_robFlushRedirect.valid
+  pcMem.io.raddr(pcMemRdIndexes("robFlush").head) := s0_robFlushRedirect.bits.ftqIdx.value
+  private val s1_robFlushPc = pcMem.io.rdata(pcMemRdIndexes("robFlush").head).startAddr + (RegEnable(s0_robFlushRedirect.bits.ftqOffset, s0_robFlushRedirect.valid) << instOffsetBits)
+  private val s3_redirectGen = redirectGen.io.stage2Redirect
+  private val s1_s3_redirect = Mux(s1_robFlushRedirect.valid, s1_robFlushRedirect, s3_redirectGen)
+  private val s2_s4_pendingRedirectValid = RegInit(false.B)
+  when (s1_s3_redirect.valid) {
+    s2_s4_pendingRedirectValid := true.B
+  }.elsewhen (GatedValidRegNext(io.frontend.toFtq.redirect.valid)) {
+    s2_s4_pendingRedirectValid := false.B
   }
 
-  val decode = Module(new DecodeStage)
-  val rat = Module(new RenameTableWrapper)
-  val ssit = Module(new SSIT)
-  val waittable = Module(new WaitTable)
-  val rename = Module(new Rename)
-  val dispatch = Module(new Dispatch)
-  val intDq = Module(new DispatchQueue(dpParams.IntDqSize, RenameWidth, dpParams.IntDqDeqWidth))
-  val fpDq = Module(new DispatchQueue(dpParams.FpDqSize, RenameWidth, dpParams.FpDqDeqWidth))
-  val lsDq = Module(new DispatchQueue(dpParams.LsDqSize, RenameWidth, dpParams.LsDqDeqWidth))
-  val redirectGen = Module(new RedirectGenerator)
+  // Redirect will be RegNext at ExuBlocks and IssueBlocks
+  val s2_s4_redirect = RegNextWithEnable(s1_s3_redirect)
+  val s3_s5_redirect = RegNextWithEnable(s2_s4_redirect)
 
-  val rob = outer.rob.module
-
-  val robPcRead = io.frontend.fromFtq.getRobFlushPcRead
-  val flushPC = robPcRead(rob.io.flushOut.bits.ftqIdx, rob.io.flushOut.bits.ftqOffset)
-
-  val flushRedirect = Wire(Valid(new Redirect))
-  flushRedirect.valid := RegNext(rob.io.flushOut.valid)
-  flushRedirect.bits := RegEnable(rob.io.flushOut.bits, rob.io.flushOut.valid)
-
-  val flushRedirectReg = Wire(Valid(new Redirect))
-  flushRedirectReg.valid := RegNext(flushRedirect.valid, init = false.B)
-  flushRedirectReg.bits := RegEnable(flushRedirect.bits, flushRedirect.valid)
-
-  val stage2Redirect = Mux(flushRedirect.valid, flushRedirect, redirectGen.io.stage2Redirect)
-  // val stage3Redirect = Mux(flushRedirectReg.valid, flushRedirectReg, redirectGen.io.stage3Redirect)
-
-  val exuRedirect = io.exuRedirect.map(x => {
-    val valid = x.valid && x.bits.redirectValid
-    val killedByOlder = x.bits.uop.robIdx.needFlush(stage2Redirect)
-    val delayed = Wire(Valid(new ExuOutput))
-    delayed.valid := RegNext(valid && !killedByOlder, init = false.B)
+  private val delayedNotFlushedWriteBack = io.fromWB.wbData.map(x => {
+    val valid = x.valid
+    val killedByOlder = x.bits.robIdx.needFlush(Seq(s1_s3_redirect, s2_s4_redirect))
+    val delayed = Wire(Valid(new ExuOutput(x.bits.params)))
+    delayed.valid := GatedValidRegNext(valid && !killedByOlder)
     delayed.bits := RegEnable(x.bits, x.valid)
+    delayed.bits.debugInfo.writebackTime := GTimer()
     delayed
-  })
-  val loadReplay = Wire(Valid(new Redirect))
-  loadReplay.valid := RegNext(io.memoryViolation.valid &&
-    !io.memoryViolation.bits.robIdx.needFlush(stage2Redirect),
-    init = false.B
-  )
-  loadReplay.bits := RegEnable(io.memoryViolation.bits, io.memoryViolation.valid)
-  io.frontend.fromFtq.getRedirectPcRead <> redirectGen.io.stage1PcRead
-  io.frontend.fromFtq.getMemPredPcRead <> redirectGen.io.memPredPcRead
-  redirectGen.io.hartId := io.hartId
-  redirectGen.io.exuMispredict <> exuRedirect
-  redirectGen.io.loadReplay <> loadReplay
-  redirectGen.io.flush := flushRedirect.valid
+  }).toSeq
+  private val delayedWriteBack = Wire(chiselTypeOf(io.fromWB.wbData))
+  delayedWriteBack.zipWithIndex.map{ case (x,i) =>
+    x.valid := GatedValidRegNext(io.fromWB.wbData(i).valid)
+    x.bits := delayedNotFlushedWriteBack(i).bits
+  }
+  val delayedNotFlushedWriteBackNeedFlush = Wire(Vec(params.allExuParams.filter(_.needExceptionGen).length, Bool()))
+  delayedNotFlushedWriteBackNeedFlush := delayedNotFlushedWriteBack.filter(_.bits.params.needExceptionGen).map{ x =>
+    x.bits.exceptionVec.get.asUInt.orR || x.bits.flushPipe.getOrElse(false.B) || x.bits.replay.getOrElse(false.B) ||
+      (if (x.bits.trigger.nonEmpty) TriggerAction.isDmode(x.bits.trigger.get) else false.B)
+  }
 
-  val frontendFlushValid = DelayN(flushRedirect.valid, 5)
-  val frontendFlushBits = RegEnable(flushRedirect.bits, flushRedirect.valid)
+  val wbDataNoStd = io.fromWB.wbData.filter(!_.bits.params.hasStdFu)
+  val intScheWbData = io.fromWB.wbData.filter(_.bits.params.schdType.isInstanceOf[IntScheduler])
+  val fpScheWbData = io.fromWB.wbData.filter(_.bits.params.schdType.isInstanceOf[FpScheduler])
+  val vfScheWbData = io.fromWB.wbData.filter(_.bits.params.schdType.isInstanceOf[VfScheduler])
+  val intCanCompress = intScheWbData.filter(_.bits.params.CanCompress)
+  val i2vWbData = intScheWbData.filter(_.bits.params.writeVecRf)
+  val f2vWbData = fpScheWbData.filter(_.bits.params.writeVecRf)
+  val memVloadWbData = io.fromWB.wbData.filter(x => x.bits.params.schdType.isInstanceOf[MemScheduler] && x.bits.params.hasVLoadFu)
+  private val delayedNotFlushedWriteBackNums = wbDataNoStd.map(x => {
+    val valid = x.valid
+    val killedByOlder = x.bits.robIdx.needFlush(Seq(s1_s3_redirect, s2_s4_redirect, s3_s5_redirect))
+    val delayed = Wire(Valid(UInt(io.fromWB.wbData.size.U.getWidth.W)))
+    delayed.valid := GatedValidRegNext(valid && !killedByOlder)
+    val isIntSche = intCanCompress.contains(x)
+    val isFpSche = fpScheWbData.contains(x)
+    val isVfSche = vfScheWbData.contains(x)
+    val isMemVload = memVloadWbData.contains(x)
+    val isi2v = i2vWbData.contains(x)
+    val isf2v = f2vWbData.contains(x)
+    val canSameRobidxWbData = if(isVfSche) {
+      i2vWbData ++ f2vWbData ++ vfScheWbData
+    } else if(isi2v) {
+      intCanCompress ++ fpScheWbData ++ vfScheWbData
+    } else if (isf2v) {
+      intCanCompress ++ fpScheWbData ++ vfScheWbData
+    } else if (isIntSche) {
+      intCanCompress ++ fpScheWbData
+    } else if (isFpSche) {
+      intCanCompress ++ fpScheWbData
+    }  else if (isMemVload) {
+      memVloadWbData
+    } else {
+      Seq(x)
+    }
+    val sameRobidxBools = VecInit(canSameRobidxWbData.map( wb => {
+      val killedByOlderThat = wb.bits.robIdx.needFlush(Seq(s1_s3_redirect, s2_s4_redirect, s3_s5_redirect))
+      (wb.bits.robIdx === x.bits.robIdx) && wb.valid && x.valid && !killedByOlderThat && !killedByOlder
+    }).toSeq)
+    delayed.bits := RegEnable(PopCount(sameRobidxBools), x.valid)
+    delayed
+  }).toSeq
+
+  private val exuPredecode = VecInit(
+    io.fromWB.wbData.filter(_.bits.redirect.nonEmpty).map(x => x.bits.predecodeInfo.get).toSeq
+  )
+
+  private val exuRedirects: Seq[ValidIO[Redirect]] = io.fromWB.wbData.filter(_.bits.redirect.nonEmpty).map(x => {
+    val hasCSR = x.bits.params.hasCSR
+    val out = Wire(Valid(new Redirect()))
+    out.valid := x.valid && x.bits.redirect.get.valid && x.bits.redirect.get.bits.cfiUpdate.isMisPred && !x.bits.robIdx.needFlush(Seq(s1_s3_redirect, s2_s4_redirect))
+    out.bits := x.bits.redirect.get.bits
+    out.bits.debugIsCtrl := true.B
+    out.bits.debugIsMemVio := false.B
+    // for fix timing, next cycle assgin
+    if (!hasCSR) {
+      out.bits.cfiUpdate.backendIAF := false.B
+      out.bits.cfiUpdate.backendIPF := false.B
+      out.bits.cfiUpdate.backendIGPF := false.B
+    }
+    out
+  }).toSeq
+  private val oldestOneHot = Redirect.selectOldestRedirect(exuRedirects)
+  private val CSROH = VecInit(io.fromWB.wbData.filter(_.bits.redirect.nonEmpty).map(x => x.bits.params.hasCSR.B))
+  private val oldestExuRedirectIsCSR = oldestOneHot === CSROH
+  private val oldestExuRedirect = Mux1H(oldestOneHot, exuRedirects)
+  private val oldestExuPredecode = Mux1H(oldestOneHot, exuPredecode)
+
+  private val memViolation = io.fromMem.violation
+  val loadReplay = Wire(ValidIO(new Redirect))
+  loadReplay.valid := GatedValidRegNext(memViolation.valid)
+  loadReplay.bits := RegEnable(memViolation.bits, memViolation.valid)
+  loadReplay.bits.debugIsCtrl := false.B
+  loadReplay.bits.debugIsMemVio := true.B
+
+  pcMem.io.ren.get(pcMemRdIndexes("redirect").head) := memViolation.valid
+  pcMem.io.raddr(pcMemRdIndexes("redirect").head) := memViolation.bits.ftqIdx.value
+  pcMem.io.ren.get(pcMemRdIndexes("memPred").head) := memViolation.valid
+  pcMem.io.raddr(pcMemRdIndexes("memPred").head) := memViolation.bits.stFtqIdx.value
+  redirectGen.io.memPredPcRead.data := pcMem.io.rdata(pcMemRdIndexes("memPred").head).startAddr + (RegEnable(memViolation.bits.stFtqOffset, memViolation.valid) << instOffsetBits)
+
+  for ((pcMemIdx, i) <- pcMemRdIndexes("bjuPc").zipWithIndex) {
+    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(i)
+    val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value
+    val roffset = io.toDataPath.pcToDataPathIO.fromDataPathFtqOffset(i)
+    pcMem.io.ren.get(pcMemIdx) := ren
+    pcMem.io.raddr(pcMemIdx) := raddr
+    io.toDataPath.pcToDataPathIO.toDataPathPC(i) := pcMem.io.rdata(pcMemIdx).startAddr
+  }
+
+  val newestEn = RegNext(io.frontend.fromFtq.newest_entry_en)
+  val newestTarget = RegEnable(io.frontend.fromFtq.newest_entry_target, io.frontend.fromFtq.newest_entry_en)
+  val newestPtr = RegEnable(io.frontend.fromFtq.newest_entry_ptr, io.frontend.fromFtq.newest_entry_en)
+  val newestTargetNext = RegEnable(newestTarget, newestEn)
+  for ((pcMemIdx, i) <- pcMemRdIndexes("bjuTarget").zipWithIndex) {
+    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(i)
+    val baseAddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value
+    val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value + 1.U
+    pcMem.io.ren.get(pcMemIdx) := ren
+    pcMem.io.raddr(pcMemIdx) := raddr
+    val needNewest = RegNext(baseAddr === newestPtr.value)
+    io.toDataPath.pcToDataPathIO.toDataPathTargetPC(i) := Mux(needNewest, newestTargetNext, pcMem.io.rdata(pcMemIdx).startAddr)
+  }
+
+  val baseIdx = params.BrhCnt
+  for ((pcMemIdx, i) <- pcMemRdIndexes("load").zipWithIndex) {
+    // load read pcMem (s0) -> get rdata (s1) -> reg next in Memblock (s2) -> reg next in Memblock (s3) -> consumed by pf (s3)
+    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(baseIdx+i)
+    val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(baseIdx+i).value
+    val roffset = io.toDataPath.pcToDataPathIO.fromDataPathFtqOffset(baseIdx+i)
+    pcMem.io.ren.get(pcMemIdx) := ren
+    pcMem.io.raddr(pcMemIdx) := raddr
+    io.toDataPath.pcToDataPathIO.toDataPathPC(baseIdx+i) := pcMem.io.rdata(pcMemIdx).startAddr
+  }
+
+  for ((pcMemIdx, i) <- pcMemRdIndexes("hybrid").zipWithIndex) {
+    // load read pcMem (s0) -> get rdata (s1) -> reg next in Memblock (s2) -> reg next in Memblock (s3) -> consumed by pf (s3)
+    pcMem.io.ren.get(pcMemIdx) := io.memHyPcRead(i).valid
+    pcMem.io.raddr(pcMemIdx) := io.memHyPcRead(i).ptr.value
+    io.memHyPcRead(i).data := pcMem.io.rdata(pcMemIdx).startAddr + (RegEnable(io.memHyPcRead(i).offset, io.memHyPcRead(i).valid) << instOffsetBits)
+  }
+
+  if (EnableStorePrefetchSMS) {
+    for ((pcMemIdx, i) <- pcMemRdIndexes("store").zipWithIndex) {
+      pcMem.io.ren.get(pcMemIdx) := io.memStPcRead(i).valid
+      pcMem.io.raddr(pcMemIdx) := io.memStPcRead(i).ptr.value
+      io.memStPcRead(i).data := pcMem.io.rdata(pcMemIdx).startAddr + (RegEnable(io.memStPcRead(i).offset, io.memStPcRead(i).valid) << instOffsetBits)
+    }
+  } else {
+    io.memStPcRead.foreach(_.data := 0.U)
+  }
+
+  /**
+   * trace begin
+   */
+  val trace = Module(new Trace)
+  trace.io.in.fromEncoder.stall  := io.traceCoreInterface.fromEncoder.stall
+  trace.io.in.fromEncoder.enable := io.traceCoreInterface.fromEncoder.enable
+  trace.io.in.fromRob            := rob.io.trace.traceCommitInfo
+  rob.io.trace.blockCommit       := trace.io.out.blockRobCommit
+  val tracePcStart = Wire(Vec(TraceGroupNum, UInt(IaddrWidth.W)))
+  for ((pcMemIdx, i) <- pcMemRdIndexes("trace").zipWithIndex) {
+    val traceValid = trace.toPcMem.blocks(i).valid
+    pcMem.io.ren.get(pcMemIdx) := traceValid
+    pcMem.io.raddr(pcMemIdx) := trace.toPcMem.blocks(i).bits.ftqIdx.get.value
+    tracePcStart(i) := pcMem.io.rdata(pcMemIdx).startAddr
+  }
+
+  // Trap/Xret only occur in block(0).
+  val tracePriv = Mux(Itype.isTrapOrXret(trace.toEncoder.blocks(0).bits.tracePipe.itype),
+    io.fromCSR.traceCSR.lastPriv,
+    io.fromCSR.traceCSR.currentPriv
+  )
+  io.traceCoreInterface.toEncoder.trap.cause := io.fromCSR.traceCSR.cause.asUInt
+  io.traceCoreInterface.toEncoder.trap.tval  := io.fromCSR.traceCSR.tval.asUInt
+  io.traceCoreInterface.toEncoder.priv       := tracePriv
+  (0 until TraceGroupNum).foreach(i => {
+    io.traceCoreInterface.toEncoder.groups(i).valid := trace.io.out.toEncoder.blocks(i).valid
+    io.traceCoreInterface.toEncoder.groups(i).bits.iaddr := tracePcStart(i)
+    io.traceCoreInterface.toEncoder.groups(i).bits.ftqOffset.foreach(_ := trace.io.out.toEncoder.blocks(i).bits.ftqOffset.getOrElse(0.U))
+    io.traceCoreInterface.toEncoder.groups(i).bits.itype := trace.io.out.toEncoder.blocks(i).bits.tracePipe.itype
+    io.traceCoreInterface.toEncoder.groups(i).bits.iretire := trace.io.out.toEncoder.blocks(i).bits.tracePipe.iretire
+    io.traceCoreInterface.toEncoder.groups(i).bits.ilastsize := trace.io.out.toEncoder.blocks(i).bits.tracePipe.ilastsize
+  })
+  /**
+   * trace end
+   */
+
+
+  redirectGen.io.hartId := io.fromTop.hartId
+  redirectGen.io.oldestExuRedirect.valid := GatedValidRegNext(oldestExuRedirect.valid)
+  redirectGen.io.oldestExuRedirect.bits := RegEnable(oldestExuRedirect.bits, oldestExuRedirect.valid)
+  redirectGen.io.oldestExuRedirectIsCSR := RegEnable(oldestExuRedirectIsCSR, oldestExuRedirect.valid)
+  redirectGen.io.instrAddrTransType := RegNext(io.fromCSR.instrAddrTransType)
+  redirectGen.io.oldestExuOutPredecode.valid := GatedValidRegNext(oldestExuPredecode.valid)
+  redirectGen.io.oldestExuOutPredecode := RegEnable(oldestExuPredecode, oldestExuPredecode.valid)
+  redirectGen.io.loadReplay <> loadReplay
+  val loadRedirectOffset = Mux(memViolation.bits.flushItself(), 0.U, Mux(memViolation.bits.isRVC, 2.U, 4.U))
+  val loadRedirectPcFtqOffset = RegEnable((memViolation.bits.ftqOffset << instOffsetBits).asUInt +& loadRedirectOffset, memViolation.valid)
+  val loadRedirectPcRead = pcMem.io.rdata(pcMemRdIndexes("redirect").head).startAddr + loadRedirectPcFtqOffset
+
+  redirectGen.io.loadReplay.bits.cfiUpdate.pc := loadRedirectPcRead
+  val load_target = loadRedirectPcRead
+  redirectGen.io.loadReplay.bits.cfiUpdate.target := load_target
+
+  redirectGen.io.robFlush := s1_robFlushRedirect
+
+  val s5_flushFromRobValidAhead = DelayN(s1_robFlushRedirect.valid, 4)
+  val s6_flushFromRobValid = GatedValidRegNext(s5_flushFromRobValidAhead)
+  val frontendFlushBits = RegEnable(s1_robFlushRedirect.bits, s1_robFlushRedirect.valid) // ??
   // When ROB commits an instruction with a flush, we notify the frontend of the flush without the commit.
   // Flushes to frontend may be delayed by some cycles and commit before flush causes errors.
   // Thus, we make all flush reasons to behave the same as exceptions for frontend.
   for (i <- 0 until CommitWidth) {
-    val is_commit = rob.io.commits.valid(i) && !rob.io.commits.isWalk && !rob.io.flushOut.valid
-    io.frontend.toFtq.rob_commits(i).valid := RegNext(is_commit)
-    io.frontend.toFtq.rob_commits(i).bits := RegEnable(rob.io.commits.info(i), is_commit)
+    // why flushOut: instructions with flushPipe are not commited to frontend
+    // If we commit them to frontend, it will cause flush after commit, which is not acceptable by frontend.
+    val s1_isCommit = rob.io.commits.commitValid(i) && rob.io.commits.isCommit && !s0_robFlushRedirect.valid
+    io.frontend.toFtq.rob_commits(i).valid := GatedValidRegNext(s1_isCommit)
+    io.frontend.toFtq.rob_commits(i).bits := RegEnable(rob.io.commits.info(i), s1_isCommit)
   }
-  io.frontend.toFtq.redirect.valid := frontendFlushValid || redirectGen.io.stage2Redirect.valid
-  io.frontend.toFtq.redirect.bits := Mux(frontendFlushValid, frontendFlushBits, redirectGen.io.stage2Redirect.bits)
+  io.frontend.toFtq.redirect.valid := s6_flushFromRobValid || s3_redirectGen.valid
+  io.frontend.toFtq.redirect.bits := Mux(s6_flushFromRobValid, frontendFlushBits, s3_redirectGen.bits)
+  io.frontend.toFtq.ftqIdxSelOH.valid := s6_flushFromRobValid || redirectGen.io.stage2Redirect.valid
+  io.frontend.toFtq.ftqIdxSelOH.bits := Cat(s6_flushFromRobValid, redirectGen.io.stage2oldestOH & Fill(NumRedirect + 1, !s6_flushFromRobValid))
+
+  //jmp/brh, sel oldest first, only use one read port
+  io.frontend.toFtq.ftqIdxAhead(0).valid := RegNext(oldestExuRedirect.valid) && !s1_robFlushRedirect.valid && !s5_flushFromRobValidAhead
+  io.frontend.toFtq.ftqIdxAhead(0).bits := RegEnable(oldestExuRedirect.bits.ftqIdx, oldestExuRedirect.valid)
+  //loadreplay
+  io.frontend.toFtq.ftqIdxAhead(NumRedirect).valid := loadReplay.valid && !s1_robFlushRedirect.valid && !s5_flushFromRobValidAhead
+  io.frontend.toFtq.ftqIdxAhead(NumRedirect).bits := loadReplay.bits.ftqIdx
+  //exception
+  io.frontend.toFtq.ftqIdxAhead.last.valid := s5_flushFromRobValidAhead
+  io.frontend.toFtq.ftqIdxAhead.last.bits := frontendFlushBits.ftqIdx
+
   // Be careful here:
-  // T0: flushRedirect.valid, exception.valid
-  // T1: csr.redirect.valid
-  // T2: csr.exception.valid
-  // T3: csr.trapTarget
-  // T4: ctrlBlock.trapTarget
-  // T5: io.frontend.toFtq.stage2Redirect.valid
-  val pc_from_csr = io.robio.toCSR.isXRet || DelayN(rob.io.exception.valid, 4)
-  val rob_flush_pc = RegEnable(Mux(flushRedirect.bits.flushItself(),
-    flushPC, // replay inst
-    flushPC + 4.U // flush pipe
-  ), flushRedirect.valid)
-  val flushTarget = Mux(pc_from_csr, io.robio.toCSR.trapTarget, rob_flush_pc)
-  when (frontendFlushValid) {
+  // T0: rob.io.flushOut, s0_robFlushRedirect
+  // T1: s1_robFlushRedirect, rob.io.exception.valid
+  // T2: csr.redirect.valid
+  // T3: csr.exception.valid
+  // T4: csr.trapTarget
+  // T5: ctrlBlock.trapTarget
+  // T6: io.frontend.toFtq.stage2Redirect.valid
+  val s2_robFlushPc = RegEnable(Mux(s1_robFlushRedirect.bits.flushItself(),
+    s1_robFlushPc, // replay inst
+    s1_robFlushPc + Mux(s1_robFlushRedirect.bits.isRVC, 2.U, 4.U) // flush pipe
+  ), s1_robFlushRedirect.valid)
+  private val s5_csrIsTrap = DelayN(rob.io.exception.valid, 4)
+  private val s5_trapTargetFromCsr = io.robio.csr.trapTarget
+
+  val flushTarget = Mux(s5_csrIsTrap, s5_trapTargetFromCsr.pc, s2_robFlushPc)
+  val s5_trapTargetIAF = Mux(s5_csrIsTrap, s5_trapTargetFromCsr.raiseIAF, false.B)
+  val s5_trapTargetIPF = Mux(s5_csrIsTrap, s5_trapTargetFromCsr.raiseIPF, false.B)
+  val s5_trapTargetIGPF = Mux(s5_csrIsTrap, s5_trapTargetFromCsr.raiseIGPF, false.B)
+  when (s6_flushFromRobValid) {
     io.frontend.toFtq.redirect.bits.level := RedirectLevel.flush
-    io.frontend.toFtq.redirect.bits.cfiUpdate.target := RegNext(flushTarget)
-  }
-  redirectGen.io.for_frontend_redirect_gen.s1_real_pc := io.frontend.fromFtq.redirect_s1_real_pc
-  io.frontend.toFtq.for_redirect_gen.s1_oldest_redirect := redirectGen.io.for_frontend_redirect_gen.s1_oldest_redirect
-  io.frontend.toFtq.for_redirect_gen.s1_oldest_exu_output := redirectGen.io.for_frontend_redirect_gen.s1_oldest_exu_output
-  io.frontend.toFtq.for_redirect_gen.s1_redirect_onehot := redirectGen.io.for_frontend_redirect_gen.s1_redirect_onehot
-  io.frontend.toFtq.for_redirect_gen.s1_jumpTarget := redirectGen.io.for_frontend_redirect_gen.s1_jumpTarget
-  io.frontend.toFtq.for_redirect_gen.rawRedirect := redirectGen.io.stage2Redirect
-  io.frontend.toFtq.for_redirect_gen.flushRedirect.valid := frontendFlushValid
-  io.frontend.toFtq.for_redirect_gen.flushRedirect.bits := frontendFlushBits
-
-  io.frontend.toFtq.for_redirect_gen.frontendFlushTarget := RegNext(flushTarget)
-  
-
-  val pendingRedirect = RegInit(false.B)
-  when (stage2Redirect.valid) {
-    pendingRedirect := true.B
-  }.elsewhen (RegNext(io.frontend.toFtq.redirect.valid)) {
-    pendingRedirect := false.B
+    io.frontend.toFtq.redirect.bits.cfiUpdate.target := RegEnable(flushTarget, s5_flushFromRobValidAhead)
+    io.frontend.toFtq.redirect.bits.cfiUpdate.backendIAF := RegEnable(s5_trapTargetIAF, s5_flushFromRobValidAhead)
+    io.frontend.toFtq.redirect.bits.cfiUpdate.backendIPF := RegEnable(s5_trapTargetIPF, s5_flushFromRobValidAhead)
+    io.frontend.toFtq.redirect.bits.cfiUpdate.backendIGPF := RegEnable(s5_trapTargetIGPF, s5_flushFromRobValidAhead)
   }
 
-  decode.io.in <> io.frontend.cfVec
+  for (i <- 0 until DecodeWidth) {
+    gpaMem.io.fromIFU := io.frontend.fromIfu
+    gpaMem.io.exceptionReadAddr.valid := rob.io.readGPAMemAddr.valid
+    gpaMem.io.exceptionReadAddr.bits.ftqPtr := rob.io.readGPAMemAddr.bits.ftqPtr
+    gpaMem.io.exceptionReadAddr.bits.ftqOffset := rob.io.readGPAMemAddr.bits.ftqOffset
+  }
+
+  // vtype commit
+  decode.io.fromCSR := io.fromCSR.toDecode
+  decode.io.fromRob.isResumeVType := rob.io.toDecode.isResumeVType
+  decode.io.fromRob.walkToArchVType := rob.io.toDecode.walkToArchVType
+  decode.io.fromRob.commitVType := rob.io.toDecode.commitVType
+  decode.io.fromRob.walkVType := rob.io.toDecode.walkVType
+
+  decode.io.redirect := s1_s3_redirect.valid || s2_s4_pendingRedirectValid
+
+  // add decode Buf for in.ready better timing
+  /**
+   * Decode buffer: when decode.io.in cannot accept all insts, use this buffer to temporarily store insts that cannot
+   * be sent to DecodeStage.
+   *
+   * Decode buffer is a "DecodeWidth"-element long register Vector of StaticInst (in decodeBufBits), with valid signals
+   * (in decodeBufValid). At the same time, fetch insts input from frontend and their valid bits. All valid elements
+   * in these two vector of insts are at the beginning, with all invalid vector elements followed.
+   *
+   * After dealing with redirection, try to use all insts in decode buffer to fulfill decoder.io.in. If decode buffer
+   * has no valid insts, use insts from frontend to supply decoder.
+   */
+
+  /** Insts to be decoded, Registers in vector of DecodeWidth */
+  val decodeBufBits = Reg(Vec(DecodeWidth, new StaticInst))
+
+  /** Valid receiving signals of instructions to be decoded, Registers in vector of DecodeWidth */
+  val decodeBufValid = RegInit(VecInit(Seq.fill(DecodeWidth)(false.B)))
+
+  /** Insts input from frontend, in vector of DecodeWidth */
+  val decodeFromFrontend = io.frontend.cfVec
+
+  /** Insts in buffer that is not ready but valid in decodeBufValid */
+  val decodeBufNotAccept = VecInit(decodeBufValid.zip(decode.io.in).map(x => x._1 && !x._2.ready))
+
+  /** Number of insts in decode buffer that is accepted. All accepted insts are before the first unaccepted one. */
+  val decodeBufAcceptNum = PriorityMuxDefault(decodeBufNotAccept.zip(Seq.tabulate(DecodeWidth)(i => i.U)), DecodeWidth.U)
+
+  /** Input valid insts from frontend that is not ready to be accepted, or decoder prefer insts in decode buffer */
+  val decodeFromFrontendNotAccept = VecInit(decodeFromFrontend.zip(decode.io.in).map(x => decodeBufValid(0) || x._1.valid && !x._2.ready))
+
+  /** Number of input insts that is accepted.
+   * All accepted insts are before the first unaccepted one. */
+  val decodeFromFrontendAcceptNum = PriorityMuxDefault(decodeFromFrontendNotAccept.zip(Seq.tabulate(DecodeWidth)(i => i.U)), DecodeWidth.U)
+
+  if (backendParams.debugEn) {
+    dontTouch(decodeBufNotAccept)
+    dontTouch(decodeBufAcceptNum)
+    dontTouch(decodeFromFrontendNotAccept)
+    dontTouch(decodeFromFrontendAcceptNum)
+  }
+
+  /**
+   * State machine of "decodeBufValid(i)":
+   *   redirect || decodeBufValid(i) is the last accepted instr in decodeBuf:
+   *     false
+   *   decodeBufValid(i) is true, decodeBufNotAccept.drop(i) has some true signals
+   *     (decodeBufAcceptNum > DecodeWidth-1-i) ? false
+   *                                     if not : decodeBufValid(i+decodeBufAcceptNum)
+   *     Pop "decodeBufAcceptNum" insts out of the decodeBufValid, and move others forward
+   *   decodeBufValid(0) is false, decodeFromFrontendNotAccept.drop(i) has some true signals
+   *     (decodeFromFrontendAcceptNum > DecodeWidth-1-i) ? false
+   *                                              if not : decodeFromFrontend(i+decodeFromFrontendAcceptNum).valid
+   *     Get first "decodeFromFrontendAcceptNum" insts from decodeFromFrontend, and move others to decodeBufValid
+   *
+   * State machine of "decodeBufBits(i)":
+   *   decodeBufValid(i) is true, decodeBufNotAccept.drop(i) has some true signals
+   *     decodeBufBits(i+decodeBufAcceptNum)
+   *   decodeBufValid(0) is false, decodeFromFrontendNotAccept.drop(i) has some true signals
+   *     decodeFromFrontend(i+decodeFromFrontendAcceptNum)
+   */
+  for (i <- 0 until DecodeWidth) {
+    // decodeBufValid update
+    when(decode.io.redirect || decodeBufValid(0) && decodeBufValid(i) && decode.io.in(i).ready && !VecInit(decodeBufNotAccept.drop(i)).asUInt.orR) {
+      decodeBufValid(i) := false.B
+    }.elsewhen(decodeBufValid(i) && VecInit(decodeBufNotAccept.drop(i)).asUInt.orR) {
+      decodeBufValid(i) := Mux(decodeBufAcceptNum > DecodeWidth.U - 1.U - i.U, false.B, decodeBufValid(i.U + decodeBufAcceptNum))
+    }.elsewhen(!decodeBufValid(0) && VecInit(decodeFromFrontendNotAccept.drop(i)).asUInt.orR) {
+      decodeBufValid(i) := Mux(decodeFromFrontendAcceptNum > DecodeWidth.U - 1.U - i.U, false.B, decodeFromFrontend(i.U + decodeFromFrontendAcceptNum).valid)
+    }
+    // decodeBufBits update
+    when(decodeBufValid(i) && VecInit(decodeBufNotAccept.drop(i)).asUInt.orR) {
+      decodeBufBits(i) := decodeBufBits(i.U + decodeBufAcceptNum)
+    }.elsewhen(!decodeBufValid(0) && VecInit(decodeFromFrontendNotAccept.drop(i)).asUInt.orR) {
+      decodeBufBits(i).connectCtrlFlow(decodeFromFrontend(i.U + decodeFromFrontendAcceptNum).bits)
+    }
+  }
+  /** Insts input from frontend, in vector of DecodeWidth */
+  val decodeConnectFromFrontend = Wire(Vec(DecodeWidth, new StaticInst))
+  decodeConnectFromFrontend.zip(decodeFromFrontend).map(x => x._1.connectCtrlFlow(x._2.bits))
+
+  /**
+   * DecodeStage's input:
+   *   decode.io.in(i).valid:
+   *     decodeBufValid(0) is true : decodeBufValid(i)            | from decode buffer
+   *                         false : decodeFromFrontend(i).valid  | from frontend
+   *
+   *   decodeFromFrontend(i).ready:
+   *     decodeFromFrontend(0).valid && !decodeBufValid(0) && decodeFromFrontend(i).valid && !decode.io.redirect
+   *     valid instr in input, no instr in decode buffer, decodeFromFrontend(i) is valid, no redirection
+   *
+   *   decode.io.in(i).bits:
+   *     decodeBufValid(i) is true : decodeBufBits(i)             | from decode buffer
+   *                         false : decodeConnectFromFrontend(i) | from frontend
+   */
+  decode.io.in.zipWithIndex.foreach { case (decodeIn, i) =>
+    decodeIn.valid := Mux(decodeBufValid(0), decodeBufValid(i), decodeFromFrontend(i).valid)
+    decodeFromFrontend(i).ready := decodeFromFrontend(0).valid && !decodeBufValid(0) && decodeFromFrontend(i).valid && !decode.io.redirect
+    decodeIn.bits := Mux(decodeBufValid(i), decodeBufBits(i), decodeConnectFromFrontend(i))
+  }
+  /** no valid instr in decode buffer && no valid instr from frontend --> can accept new instr from frontend */
+  io.frontend.canAccept := !decodeBufValid(0) || !decodeFromFrontend(0).valid
   decode.io.csrCtrl := RegNext(io.csrCtrl)
+  decode.io.intRat <> rat.io.intReadPorts
+  decode.io.fpRat <> rat.io.fpReadPorts
+  decode.io.vecRat <> rat.io.vecReadPorts
+  decode.io.v0Rat <> rat.io.v0ReadPorts
+  decode.io.vlRat <> rat.io.vlReadPorts
+  decode.io.fusion := 0.U.asTypeOf(decode.io.fusion) // Todo
+  decode.io.stallReason.in <> io.frontend.stallReason
+
+  // snapshot check
+  class CFIRobIdx extends Bundle {
+    val robIdx = Vec(RenameWidth, new RobPtr)
+    val isCFI = Vec(RenameWidth, Bool())
+  }
+  val genSnapshot = Cat(rename.io.out.map(out => out.fire && out.bits.snapshot)).orR
+  val snpt = Module(new SnapshotGenerator(0.U.asTypeOf(new CFIRobIdx)))
+  snpt.io.enq := genSnapshot
+  snpt.io.enqData.robIdx := rename.io.out.map(_.bits.robIdx)
+  snpt.io.enqData.isCFI := rename.io.out.map(_.bits.snapshot)
+  snpt.io.deq := snpt.io.valids(snpt.io.deqPtr.value) && rob.io.commits.isCommit &&
+    Cat(rob.io.commits.commitValid.zip(rob.io.commits.robIdx).map(x => x._1 && x._2 === snpt.io.snapshots(snpt.io.deqPtr.value).robIdx.head)).orR
+  snpt.io.redirect := s1_s3_redirect.valid
+  val flushVec = VecInit(snpt.io.snapshots.map { snapshot =>
+    val notCFIMask = snapshot.isCFI.map(~_)
+    val shouldFlush = snapshot.robIdx.map(robIdx => robIdx >= s1_s3_redirect.bits.robIdx || robIdx.value === s1_s3_redirect.bits.robIdx.value)
+    val shouldFlushMask = (1 to RenameWidth).map(shouldFlush take _ reduce (_ || _))
+    s1_s3_redirect.valid && Cat(shouldFlushMask.zip(notCFIMask).map(x => x._1 | x._2)).andR
+  })
+  val flushVecNext = flushVec zip snpt.io.valids map (x => GatedValidRegNext(x._1 && x._2, false.B))
+  snpt.io.flushVec := flushVecNext
+
+  val redirectRobidx = s1_s3_redirect.bits.robIdx
+  val useSnpt = VecInit.tabulate(RenameSnapshotNum){ case idx =>
+    val snptRobidx = snpt.io.snapshots(idx).robIdx.head
+    // (redirectRobidx.value =/= snptRobidx.value) for only flag diffrence
+    snpt.io.valids(idx) && ((redirectRobidx > snptRobidx) && (redirectRobidx.value =/= snptRobidx.value) ||
+      !s1_s3_redirect.bits.flushItself() && redirectRobidx === snptRobidx)
+  }.reduceTree(_ || _)
+  val snptSelect = MuxCase(
+    0.U(log2Ceil(RenameSnapshotNum).W),
+    (1 to RenameSnapshotNum).map(i => (snpt.io.enqPtr - i.U).value).map{case idx =>
+      val thisSnapRobidx = snpt.io.snapshots(idx).robIdx.head
+      (snpt.io.valids(idx) && (redirectRobidx > thisSnapRobidx && (redirectRobidx.value =/= thisSnapRobidx.value) ||
+        !s1_s3_redirect.bits.flushItself() && redirectRobidx === thisSnapRobidx), idx)
+    }
+  )
+
+  rob.io.snpt.snptEnq := DontCare
+  rob.io.snpt.snptDeq := snpt.io.deq
+  rob.io.snpt.useSnpt := useSnpt
+  rob.io.snpt.snptSelect := snptSelect
+  rob.io.snpt.flushVec := flushVecNext
+  rat.io.snpt.snptEnq := genSnapshot
+  rat.io.snpt.snptDeq := snpt.io.deq
+  rat.io.snpt.useSnpt := useSnpt
+  rat.io.snpt.snptSelect := snptSelect
+  rat.io.snpt.flushVec := flushVec
+
+  val decodeHasException = decode.io.out.map(x => x.bits.exceptionVec(instrPageFault) || x.bits.exceptionVec(instrAccessFault))
+  // fusion decoder
+  for (i <- 0 until DecodeWidth) {
+    fusionDecoder.io.in(i).valid := decode.io.out(i).valid && !(decodeHasException(i) || disableFusion)
+    fusionDecoder.io.in(i).bits := decode.io.out(i).bits.instr
+    if (i > 0) {
+      fusionDecoder.io.inReady(i - 1) := decode.io.out(i).ready
+    }
+  }
+
+  private val decodePipeRename = Wire(Vec(RenameWidth, DecoupledIO(new DecodedInst)))
+  for (i <- 0 until RenameWidth) {
+    PipelineConnect(decode.io.out(i), decodePipeRename(i), rename.io.in(i).ready,
+      s1_s3_redirect.valid || s2_s4_pendingRedirectValid, moduleName = Some("decodePipeRenameModule"))
+
+    decodePipeRename(i).ready := rename.io.in(i).ready
+    rename.io.in(i).valid := decodePipeRename(i).valid && !fusionDecoder.io.clear(i)
+    rename.io.in(i).bits := decodePipeRename(i).bits
+    dispatch.io.renameIn(i).valid := decodePipeRename(i).valid && !fusionDecoder.io.clear(i) && !decodePipeRename(i).bits.isMove
+    dispatch.io.renameIn(i).bits := decodePipeRename(i).bits
+  }
+
+  for (i <- 0 until RenameWidth - 1) {
+    fusionDecoder.io.dec(i) := decodePipeRename(i).bits
+    rename.io.fusionInfo(i) := fusionDecoder.io.info(i)
+
+    // update the first RenameWidth - 1 instructions
+    decode.io.fusion(i) := fusionDecoder.io.out(i).valid && rename.io.out(i).fire
+    // TODO: remove this dirty code for ftq update
+    val sameFtqPtr = rename.io.in(i).bits.ftqPtr.value === rename.io.in(i + 1).bits.ftqPtr.value
+    val ftqOffset0 = rename.io.in(i).bits.ftqOffset
+    val ftqOffset1 = rename.io.in(i + 1).bits.ftqOffset
+    val ftqOffsetDiff = ftqOffset1 - ftqOffset0
+    val cond1 = sameFtqPtr && ftqOffsetDiff === 1.U
+    val cond2 = sameFtqPtr && ftqOffsetDiff === 2.U
+    val cond3 = !sameFtqPtr && ftqOffset1 === 0.U
+    val cond4 = !sameFtqPtr && ftqOffset1 === 1.U
+    when (fusionDecoder.io.out(i).valid) {
+      fusionDecoder.io.out(i).bits.update(rename.io.in(i).bits)
+      fusionDecoder.io.out(i).bits.update(dispatch.io.renameIn(i).bits)
+      rename.io.in(i).bits.commitType := Mux(cond1, 4.U, Mux(cond2, 5.U, Mux(cond3, 6.U, 7.U)))
+    }
+    XSError(fusionDecoder.io.out(i).valid && !cond1 && !cond2 && !cond3 && !cond4, p"new condition $sameFtqPtr $ftqOffset0 $ftqOffset1\n")
+  }
 
   // memory dependency predict
   // when decode, send fold pc to mdp
+  private val mdpFlodPcVecVld = Wire(Vec(DecodeWidth, Bool()))
+  private val mdpFlodPcVec = Wire(Vec(DecodeWidth, UInt(MemPredPCWidth.W)))
   for (i <- 0 until DecodeWidth) {
-    val mdp_foldpc = Mux(
-      decode.io.out(i).fire(),
+    mdpFlodPcVecVld(i) := decode.io.out(i).fire || GatedValidRegNext(decode.io.out(i).fire)
+    mdpFlodPcVec(i) := Mux(
+      decode.io.out(i).fire,
       decode.io.in(i).bits.foldpc,
-      rename.io.in(i).bits.cf.foldpc
+      rename.io.in(i).bits.foldpc
     )
-    ssit.io.raddr(i) := mdp_foldpc
-    waittable.io.raddr(i) := mdp_foldpc
   }
+
   // currently, we only update mdp info when isReplay
-  ssit.io.update <> RegNext(redirectGen.io.memPredUpdate)
-  ssit.io.csrCtrl := RegNext(io.csrCtrl)
-  waittable.io.update <> RegNext(redirectGen.io.memPredUpdate)
-  waittable.io.csrCtrl := RegNext(io.csrCtrl)
+  memCtrl.io.redirect := s1_s3_redirect
+  memCtrl.io.csrCtrl := io.csrCtrl                          // RegNext in memCtrl
+  memCtrl.io.stIn := io.fromMem.stIn                        // RegNext in memCtrl
+  memCtrl.io.memPredUpdate := redirectGen.io.memPredUpdate  // RegNext in memCtrl
+  memCtrl.io.mdpFoldPcVecVld := mdpFlodPcVecVld
+  memCtrl.io.mdpFlodPcVec := mdpFlodPcVec
+  memCtrl.io.dispatchLFSTio <> dispatch.io.lfst
 
-  // LFST lookup and update
-  val lfst = Module(new LFST)
-  lfst.io.redirect <> RegNext(io.redirect)
-  lfst.io.storeIssue <> RegNext(io.stIn)
-  lfst.io.csrCtrl <> RegNext(io.csrCtrl)
-  lfst.io.dispatch <> dispatch.io.lfst
-
-  rat.io.robCommits := rob.io.commits
-  for ((r, i) <- rat.io.intReadPorts.zipWithIndex) {
-    val raddr = decode.io.out(i).bits.ctrl.lsrc.take(2) :+ decode.io.out(i).bits.ctrl.ldest
-    r.map(_.addr).zip(raddr).foreach(x => x._1 := x._2)
-    rename.io.intReadPorts(i) := r.map(_.data)
-    r.foreach(_.hold := !rename.io.in(i).ready)
-  }
+  rat.io.redirect := s1_s3_redirect.valid
+  rat.io.rabCommits := rob.io.rabCommits
+  rat.io.diffCommits.foreach(_ := rob.io.diffCommits.get)
   rat.io.intRenamePorts := rename.io.intRenamePorts
-  for ((r, i) <- rat.io.fpReadPorts.zipWithIndex) {
-    val raddr = decode.io.out(i).bits.ctrl.lsrc.take(3) :+ decode.io.out(i).bits.ctrl.ldest
-    r.map(_.addr).zip(raddr).foreach(x => x._1 := x._2)
-    rename.io.fpReadPorts(i) := r.map(_.data)
-    r.foreach(_.hold := !rename.io.in(i).ready)
-  }
   rat.io.fpRenamePorts := rename.io.fpRenamePorts
-  rat.io.debug_int_rat <> io.debug_int_rat
-  rat.io.debug_fp_rat <> io.debug_fp_rat
+  rat.io.vecRenamePorts := rename.io.vecRenamePorts
+  rat.io.v0RenamePorts := rename.io.v0RenamePorts
+  rat.io.vlRenamePorts := rename.io.vlRenamePorts
 
-  // pipeline between decode and rename
-  for (i <- 0 until RenameWidth) {
-    PipelineConnect(decode.io.out(i), rename.io.in(i), rename.io.in(i).ready,
-      stage2Redirect.valid || pendingRedirect)
+  rename.io.redirect := s1_s3_redirect
+  rename.io.rabCommits := rob.io.rabCommits
+  rename.io.singleStep := GatedValidRegNext(io.csrCtrl.singlestep)
+  rename.io.waittable := (memCtrl.io.waitTable2Rename zip decode.io.out).map{ case(waittable2rename, decodeOut) =>
+    RegEnable(waittable2rename, decodeOut.fire)
   }
+  rename.io.ssit := memCtrl.io.ssit2Rename
+  // disble mdp
+  dispatch.io.lfst.resp := 0.U.asTypeOf(dispatch.io.lfst.resp)
+  rename.io.waittable := 0.U.asTypeOf(rename.io.waittable)
+  rename.io.ssit := 0.U.asTypeOf(rename.io.ssit)
+  rename.io.intReadPorts := VecInit(rat.io.intReadPorts.map(x => VecInit(x.map(_.data))))
+  rename.io.fpReadPorts := VecInit(rat.io.fpReadPorts.map(x => VecInit(x.map(_.data))))
+  rename.io.vecReadPorts := VecInit(rat.io.vecReadPorts.map(x => VecInit(x.map(_.data))))
+  rename.io.v0ReadPorts := VecInit(rat.io.v0ReadPorts.map(x => VecInit(x.data)))
+  rename.io.vlReadPorts := VecInit(rat.io.vlReadPorts.map(x => VecInit(x.data)))
+  rename.io.int_need_free := rat.io.int_need_free
+  rename.io.int_old_pdest := rat.io.int_old_pdest
+  rename.io.fp_old_pdest := rat.io.fp_old_pdest
+  rename.io.vec_old_pdest := rat.io.vec_old_pdest
+  rename.io.v0_old_pdest := rat.io.v0_old_pdest
+  rename.io.vl_old_pdest := rat.io.vl_old_pdest
+  rename.io.debug_int_rat.foreach(_ := rat.io.debug_int_rat.get)
+  rename.io.debug_fp_rat.foreach(_ := rat.io.debug_fp_rat.get)
+  rename.io.debug_vec_rat.foreach(_ := rat.io.debug_vec_rat.get)
+  rename.io.debug_v0_rat.foreach(_ := rat.io.debug_v0_rat.get)
+  rename.io.debug_vl_rat.foreach(_ := rat.io.debug_vl_rat.get)
+  rename.io.stallReason.in <> decode.io.stallReason.out
+  rename.io.snpt.snptEnq := DontCare
+  rename.io.snpt.snptDeq := snpt.io.deq
+  rename.io.snpt.useSnpt := useSnpt
+  rename.io.snpt.snptSelect := snptSelect
+  rename.io.snptIsFull := snpt.io.valids.asUInt.andR
+  rename.io.snpt.flushVec := flushVecNext
+  rename.io.snptLastEnq.valid := !isEmpty(snpt.io.enqPtr, snpt.io.deqPtr)
+  rename.io.snptLastEnq.bits := snpt.io.snapshots((snpt.io.enqPtr - 1.U).value).robIdx.head
 
-  rename.io.redirect <> stage2Redirect
-  rename.io.robCommits <> rob.io.commits
-  rename.io.ssit <> ssit.io.rdata
-  rename.io.waittable <> RegNext(waittable.io.rdata)
+  val renameOut = Wire(chiselTypeOf(rename.io.out))
+  renameOut <> rename.io.out
+  // pass all snapshot in the first element for correctness of blockBackward
+  renameOut.tail.foreach(_.bits.snapshot := false.B)
+  renameOut.head.bits.snapshot := Mux(isFull(snpt.io.enqPtr, snpt.io.deqPtr),
+    false.B,
+    Cat(rename.io.out.map(out => out.valid && out.bits.snapshot)).orR
+  )
 
   // pipeline between rename and dispatch
-  for (i <- 0 until RenameWidth) {
-    PipelineConnect(rename.io.out(i), dispatch.io.fromRename(i), dispatch.io.recv(i), stage2Redirect.valid)
+  PipeGroupConnect(renameOut, dispatch.io.fromRename, s1_s3_redirect.valid, dispatch.io.toRenameAllFire, "renamePipeDispatch")
+
+  dispatch.io.redirect := s1_s3_redirect
+  val enqRob = Wire(chiselTypeOf(rob.io.enq))
+  enqRob.canAccept := rob.io.enq.canAccept
+  enqRob.canAcceptForDispatch := rob.io.enq.canAcceptForDispatch
+  enqRob.isEmpty := rob.io.enq.isEmpty
+  enqRob.resp := rob.io.enq.resp
+  enqRob.needAlloc := RegNext(dispatch.io.enqRob.needAlloc)
+  enqRob.req.zip(dispatch.io.enqRob.req).map { case (sink, source) =>
+    sink.valid := RegNext(source.valid && !rob.io.redirect.valid)
+    sink.bits := RegEnable(source.bits, source.valid)
   }
+  dispatch.io.enqRob.canAccept := enqRob.canAcceptForDispatch && !enqRob.req.map(x => x.valid && x.bits.blockBackward && enqRob.canAccept).reduce(_ || _)
+  dispatch.io.enqRob.canAcceptForDispatch := enqRob.canAcceptForDispatch
+  dispatch.io.enqRob.isEmpty := enqRob.isEmpty && !enqRob.req.map(_.valid).reduce(_ || _)
+  dispatch.io.enqRob.resp := enqRob.resp
+  rob.io.enq.needAlloc := enqRob.needAlloc
+  rob.io.enq.req := enqRob.req
+  dispatch.io.robHead := rob.io.debugRobHead
+  dispatch.io.stallReason <> rename.io.stallReason.out
+  dispatch.io.lqCanAccept := io.lqCanAccept
+  dispatch.io.sqCanAccept := io.sqCanAccept
+  dispatch.io.fromMem.lcommit := io.fromMemToDispatch.lcommit
+  dispatch.io.fromMem.scommit := io.fromMemToDispatch.scommit
+  dispatch.io.fromMem.lqDeqPtr := io.fromMemToDispatch.lqDeqPtr
+  dispatch.io.fromMem.sqDeqPtr := io.fromMemToDispatch.sqDeqPtr
+  dispatch.io.fromMem.lqCancelCnt := io.fromMemToDispatch.lqCancelCnt
+  dispatch.io.fromMem.sqCancelCnt := io.fromMemToDispatch.sqCancelCnt
+  io.toMem.lsqEnqIO <> dispatch.io.toMem.lsqEnqIO
+  dispatch.io.wakeUpAll.wakeUpInt := io.toDispatch.wakeUpInt
+  dispatch.io.wakeUpAll.wakeUpFp  := io.toDispatch.wakeUpFp
+  dispatch.io.wakeUpAll.wakeUpVec := io.toDispatch.wakeUpVec
+  dispatch.io.wakeUpAll.wakeUpMem := io.toDispatch.wakeUpMem
+  dispatch.io.IQValidNumVec := io.toDispatch.IQValidNumVec
+  dispatch.io.ldCancel := io.toDispatch.ldCancel
+  dispatch.io.og0Cancel := io.toDispatch.og0Cancel
+  dispatch.io.wbPregsInt := io.toDispatch.wbPregsInt
+  dispatch.io.wbPregsFp := io.toDispatch.wbPregsFp
+  dispatch.io.wbPregsVec := io.toDispatch.wbPregsVec
+  dispatch.io.wbPregsV0 := io.toDispatch.wbPregsV0
+  dispatch.io.wbPregsVl := io.toDispatch.wbPregsVl
+  dispatch.io.robHeadNotReady := rob.io.headNotReady
+  dispatch.io.robFull := rob.io.robFull
+  dispatch.io.singleStep := GatedValidRegNext(io.csrCtrl.singlestep)
 
-  dispatch.io.hartId := io.hartId
-  dispatch.io.redirect <> stage2Redirect
-  dispatch.io.enqRob <> rob.io.enq
-  dispatch.io.toIntDq <> intDq.io.enq
-  dispatch.io.toFpDq <> fpDq.io.enq
-  dispatch.io.toLsDq <> lsDq.io.enq
-  dispatch.io.allocPregs <> io.allocPregs
-  dispatch.io.singleStep := RegNext(io.csrCtrl.singlestep)
+  val toIssueBlockUops = Seq(io.toIssueBlock.intUops, io.toIssueBlock.fpUops, io.toIssueBlock.vfUops, io.toIssueBlock.memUops).flatten
+  toIssueBlockUops.zip(dispatch.io.toIssueQueues).map(x => x._1 <> x._2)
+  io.toIssueBlock.flush   <> s2_s4_redirect
 
-  intDq.io.redirect <> stage2Redirect
-  fpDq.io.redirect <> stage2Redirect
-  lsDq.io.redirect <> stage2Redirect
+  pcMem.io.wen.head   := GatedValidRegNext(io.frontend.fromFtq.pc_mem_wen)
+  pcMem.io.waddr.head := RegEnable(io.frontend.fromFtq.pc_mem_waddr, io.frontend.fromFtq.pc_mem_wen)
+  pcMem.io.wdata.head := RegEnable(io.frontend.fromFtq.pc_mem_wdata, io.frontend.fromFtq.pc_mem_wen)
 
-  io.dispatch <> intDq.io.deq ++ lsDq.io.deq ++ fpDq.io.deq
+  io.toDataPath.flush := s2_s4_redirect
+  io.toExuBlock.flush := s2_s4_redirect
 
-  val pingpong = RegInit(false.B)
-  pingpong := !pingpong
-  val jumpInst = Mux(pingpong && (exuParameters.AluCnt > 2).B, io.dispatch(2).bits, io.dispatch(0).bits)
-  val jumpPcRead = io.frontend.fromFtq.getJumpPcRead
-  io.jumpPc := jumpPcRead(jumpInst.cf.ftqPtr, jumpInst.cf.ftqOffset)
-  val jumpTargetRead = io.frontend.fromFtq.target_read
-  io.jalr_target := jumpTargetRead(jumpInst.cf.ftqPtr, jumpInst.cf.ftqOffset)
 
-  rob.io.hartId := io.hartId
-  io.cpu_halt := DelayN(rob.io.cpu_halt, 5)
-  rob.io.redirect <> stage2Redirect
-  outer.rob.generateWritebackIO(Some(outer), Some(this))
+  rob.io.hartId := io.fromTop.hartId
+  rob.io.redirect := s1_s3_redirect
+  rob.io.writeback := delayedNotFlushedWriteBack
+  rob.io.exuWriteback := delayedWriteBack
+  rob.io.writebackNums := VecInit(delayedNotFlushedWriteBackNums)
+  rob.io.writebackNeedFlush := delayedNotFlushedWriteBackNeedFlush
+  rob.io.readGPAMemData := gpaMem.io.exceptionReadData
+  rob.io.fromVecExcpMod.busy := io.fromVecExcpMod.busy
 
-  io.redirect <> stage2Redirect
+  io.redirect := s1_s3_redirect
 
   // rob to int block
-  io.robio.toCSR <> rob.io.csr
-  io.robio.toCSR.perfinfo.retiredInstr <> RegNext(rob.io.csr.perfinfo.retiredInstr)
+  io.robio.csr <> rob.io.csr
+  // When wfi is disabled, it will not block ROB commit.
+  rob.io.csr.wfiEvent := io.robio.csr.wfiEvent
+  rob.io.wfi_enable := decode.io.csrCtrl.wfi_enable
+
+  io.toTop.cpuHalt := DelayN(rob.io.cpu_halt, 5)
+
+  io.robio.csr.perfinfo.retiredInstr <> RegNext(rob.io.csr.perfinfo.retiredInstr)
   io.robio.exception := rob.io.exception
-  io.robio.exception.bits.uop.cf.pc := flushPC
+  io.robio.exception.bits.pc := s1_robFlushPc
 
   // rob to mem block
   io.robio.lsq <> rob.io.lsq
 
-  io.perfInfo.ctrlInfo.robFull := RegNext(rob.io.robFull)
-  io.perfInfo.ctrlInfo.intdqFull := RegNext(intDq.io.dqFull)
-  io.perfInfo.ctrlInfo.fpdqFull := RegNext(fpDq.io.dqFull)
-  io.perfInfo.ctrlInfo.lsdqFull := RegNext(lsDq.io.dqFull)
+  io.diff_int_rat.foreach(_ := rat.io.diff_int_rat.get)
+  io.diff_fp_rat .foreach(_ := rat.io.diff_fp_rat.get)
+  io.diff_vec_rat.foreach(_ := rat.io.diff_vec_rat.get)
+  io.diff_v0_rat .foreach(_ := rat.io.diff_v0_rat.get)
+  io.diff_vl_rat .foreach(_ := rat.io.diff_vl_rat.get)
 
-  val pfevent = Module(new PFEvent)
-  pfevent.io.distribute_csr := RegNext(io.csrCtrl.distribute_csr)
-  val csrevents = pfevent.io.hpmevent.slice(8,16)
+  rob.io.debug_ls := io.robio.debug_ls
+  rob.io.debugHeadLsIssue := io.robio.robHeadLsIssue
+  rob.io.lsTopdownInfo := io.robio.lsTopdownInfo
+  rob.io.csr.criticalErrorState := io.robio.csr.criticalErrorState
+  rob.io.debugEnqLsq := io.debugEnqLsq
 
-  val perfinfo = IO(new Bundle(){
-    val perfEventsRs      = Input(Vec(NumRs, new PerfEvent))
-    val perfEventsEu0     = Input(Vec(6, new PerfEvent))
-    val perfEventsEu1     = Input(Vec(6, new PerfEvent))
+  io.robio.robDeqPtr := rob.io.robDeqPtr
+
+  io.robio.storeDebugInfo <> rob.io.storeDebugInfo
+
+  // rob to backend
+  io.robio.commitVType := rob.io.toDecode.commitVType
+  // exu block to decode
+  decode.io.vsetvlVType := io.toDecode.vsetvlVType
+  // backend to decode
+  decode.io.vstart := io.toDecode.vstart
+  // backend to rob
+  rob.io.vstartIsZero := io.toDecode.vstart === 0.U
+
+  io.toCSR.trapInstInfo := decode.io.toCSR.trapInstInfo
+
+  io.toVecExcpMod.logicPhyRegMap := rob.io.toVecExcpMod.logicPhyRegMap
+  io.toVecExcpMod.excpInfo       := rob.io.toVecExcpMod.excpInfo
+  // T  : rat receive rabCommit
+  // T+1: rat return oldPdest
+  io.toVecExcpMod.ratOldPest match {
+    case fromRat =>
+      (0 until RabCommitWidth).foreach { idx =>
+        val v0Valid = RegNext(
+          rat.io.rabCommits.isCommit &&
+          rat.io.rabCommits.isWalk &&
+          rat.io.rabCommits.commitValid(idx) &&
+          rat.io.rabCommits.info(idx).v0Wen
+        )
+        fromRat.v0OldVdPdest(idx).valid := RegNext(v0Valid)
+        fromRat.v0OldVdPdest(idx).bits := RegEnable(rat.io.v0_old_pdest(idx), v0Valid)
+        val vecValid = RegNext(
+          rat.io.rabCommits.isCommit &&
+          rat.io.rabCommits.isWalk &&
+          rat.io.rabCommits.commitValid(idx) &&
+          rat.io.rabCommits.info(idx).vecWen
+        )
+        fromRat.vecOldVdPdest(idx).valid := RegNext(vecValid)
+        fromRat.vecOldVdPdest(idx).bits := RegEnable(rat.io.vec_old_pdest(idx), vecValid)
+      }
+  }
+
+  io.debugTopDown.fromRob := rob.io.debugTopDown.toCore
+  dispatch.io.debugTopDown.fromRob := rob.io.debugTopDown.toDispatch
+  dispatch.io.debugTopDown.fromCore := io.debugTopDown.fromCore
+  io.debugRolling := rob.io.debugRolling
+
+  io.perfInfo.ctrlInfo.robFull := GatedValidRegNext(rob.io.robFull)
+  io.perfInfo.ctrlInfo.intdqFull := false.B
+  io.perfInfo.ctrlInfo.fpdqFull := false.B
+  io.perfInfo.ctrlInfo.lsdqFull := false.B
+
+  val perfEvents = Seq(decode, rename, dispatch, rob).flatMap(_.getPerfEvents)
+  generatePerfEvent()
+
+  val criticalErrors = rob.getCriticalErrors
+  generateCriticalErrors()
+}
+
+class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBundle {
+  val fromTop = new Bundle {
+    val hartId = Input(UInt(8.W))
+  }
+  val toTop = new Bundle {
+    val cpuHalt = Output(Bool())
+  }
+  val frontend = Flipped(new FrontendToCtrlIO())
+  val fromCSR = new Bundle{
+    val toDecode = Input(new CSRToDecode)
+    val traceCSR = Input(new TraceCSR)
+    val instrAddrTransType = Input(new AddrTransType)
+  }
+  val toIssueBlock = new Bundle {
+    val flush = ValidIO(new Redirect)
+    val intUopsNum = backendParams.intSchdParams.get.issueBlockParams.map(_.numEnq).sum
+    val fpUopsNum = backendParams.fpSchdParams.get.issueBlockParams.map(_.numEnq).sum
+    val vfUopsNum = backendParams.vfSchdParams.get.issueBlockParams.map(_.numEnq).sum
+    val memUopsNum = backendParams.memSchdParams.get.issueBlockParams.filter(x => x.StdCnt == 0).map(_.numEnq).sum
+    val intUops = Vec(intUopsNum, DecoupledIO(new DynInst))
+    val fpUops = Vec(fpUopsNum, DecoupledIO(new DynInst))
+    val vfUops = Vec(vfUopsNum, DecoupledIO(new DynInst))
+    val memUops = Vec(memUopsNum, DecoupledIO(new DynInst))
+  }
+  val fromMemToDispatch = new Bundle {
+    val lcommit = Input(UInt(log2Up(CommitWidth + 1).W))
+    val scommit = Input(UInt(log2Ceil(EnsbufferWidth + 1).W)) // connected to `memBlock.io.sqDeq` instead of ROB
+    val lqDeqPtr = Input(new LqPtr)
+    val sqDeqPtr = Input(new SqPtr)
+    // from lsq
+    val lqCancelCnt = Input(UInt(log2Up(VirtualLoadQueueSize + 1).W))
+    val sqCancelCnt = Input(UInt(log2Up(StoreQueueSize + 1).W))
+  }
+  //toMem
+  val toMem = new Bundle {
+    val lsqEnqIO = Flipped(new LsqEnqIO)
+  }
+  val toDispatch = new Bundle {
+    val wakeUpInt = Flipped(backendParams.intSchdParams.get.genIQWakeUpOutValidBundle)
+    val wakeUpFp  = Flipped(backendParams.fpSchdParams.get.genIQWakeUpOutValidBundle)
+    val wakeUpVec = Flipped(backendParams.vfSchdParams.get.genIQWakeUpOutValidBundle)
+    val wakeUpMem = Flipped(backendParams.memSchdParams.get.genIQWakeUpOutValidBundle)
+    val allIssueParams = backendParams.allIssueParams.filter(_.StdCnt == 0)
+    val allExuParams = allIssueParams.map(_.exuBlockParams).flatten
+    val exuNum = allExuParams.size
+    val maxIQSize = allIssueParams.map(_.numEntries).max
+    val IQValidNumVec = Vec(exuNum, Input(UInt(maxIQSize.U.getWidth.W)))
+    val og0Cancel = Input(ExuVec())
+    val ldCancel = Vec(backendParams.LdExuCnt, Flipped(new LoadCancelIO))
+    val wbPregsInt = Vec(backendParams.numPregWb(IntData()), Flipped(ValidIO(UInt(PhyRegIdxWidth.W))))
+    val wbPregsFp = Vec(backendParams.numPregWb(FpData()), Flipped(ValidIO(UInt(PhyRegIdxWidth.W))))
+    val wbPregsVec = Vec(backendParams.numPregWb(VecData()), Flipped(ValidIO(UInt(PhyRegIdxWidth.W))))
+    val wbPregsV0 = Vec(backendParams.numPregWb(V0Data()), Flipped(ValidIO(UInt(PhyRegIdxWidth.W))))
+    val wbPregsVl = Vec(backendParams.numPregWb(VlData()), Flipped(ValidIO(UInt(PhyRegIdxWidth.W))))
+  }
+  val toDataPath = new Bundle {
+    val flush = ValidIO(new Redirect)
+    val pcToDataPathIO = new PcToDataPathIO(params)
+  }
+  val toExuBlock = new Bundle {
+    val flush = ValidIO(new Redirect)
+  }
+  val toCSR = new Bundle {
+    val trapInstInfo = Output(ValidIO(new TrapInstInfo))
+  }
+  val fromWB = new Bundle {
+    val wbData = Flipped(MixedVec(params.genWrite2CtrlBundles))
+  }
+  val redirect = ValidIO(new Redirect)
+  val fromMem = new Bundle {
+    val stIn = Vec(params.StaExuCnt, Flipped(ValidIO(new DynInst))) // use storeSetHit, ssid, robIdx
+    val violation = Flipped(ValidIO(new Redirect))
+  }
+  val memStPcRead = Vec(params.StaCnt, Flipped(new FtqRead(UInt(VAddrBits.W))))
+  val memHyPcRead = Vec(params.HyuCnt, Flipped(new FtqRead(UInt(VAddrBits.W))))
+
+  val csrCtrl = Input(new CustomCSRCtrlIO)
+  val robio = new Bundle {
+    val csr = new RobCSRIO
+    val exception = ValidIO(new ExceptionInfo)
+    val lsq = new RobLsqIO
+    val lsTopdownInfo = Vec(params.LduCnt + params.HyuCnt, Input(new LsTopdownInfo))
+    val debug_ls = Input(new DebugLSIO())
+    val robHeadLsIssue = Input(Bool())
+    val robDeqPtr = Output(new RobPtr)
+    val commitVType = new Bundle {
+      val vtype = Output(ValidIO(VType()))
+      val hasVsetvl = Output(Bool())
+    }
+
+    // store event difftest information
+    val storeDebugInfo = Vec(EnsbufferWidth, new Bundle {
+      val robidx = Input(new RobPtr)
+      val pc     = Output(UInt(VAddrBits.W))
+    })
+  }
+
+  val toDecode = new Bundle {
+    val vsetvlVType = Input(VType())
+    val vstart = Input(Vl())
+  }
+
+  val fromVecExcpMod = Input(new Bundle {
+    val busy = Bool()
   })
 
-  val allPerfEvents = Seq(decode, rename, dispatch, intDq, fpDq, lsDq, rob).flatMap(_.getPerf)
-  val hpmEvents = allPerfEvents ++ perfinfo.perfEventsEu0 ++ perfinfo.perfEventsEu1 ++ perfinfo.perfEventsRs
-  val perfEvents = HPerfMonitor(csrevents, hpmEvents).getPerfEvents
-  generatePerfEvent()
+  val toVecExcpMod = Output(new Bundle {
+    val logicPhyRegMap = Vec(RabCommitWidth, ValidIO(new RegWriteFromRab))
+    val excpInfo = ValidIO(new VecExcpInfo)
+    val ratOldPest = new RatToVecExcpMod
+  })
+
+  val traceCoreInterface = new TraceCoreInterface(hasOffset = true)
+
+  val perfInfo = Output(new Bundle{
+    val ctrlInfo = new Bundle {
+      val robFull   = Bool()
+      val intdqFull = Bool()
+      val fpdqFull  = Bool()
+      val lsdqFull  = Bool()
+    }
+  })
+  val diff_int_rat = if (params.basicDebugEn) Some(Vec(32, Output(UInt(PhyRegIdxWidth.W)))) else None
+  val diff_fp_rat  = if (params.basicDebugEn) Some(Vec(32, Output(UInt(PhyRegIdxWidth.W)))) else None
+  val diff_vec_rat = if (params.basicDebugEn) Some(Vec(31, Output(UInt(PhyRegIdxWidth.W)))) else None
+  val diff_v0_rat  = if (params.basicDebugEn) Some(Vec(1, Output(UInt(PhyRegIdxWidth.W)))) else None
+  val diff_vl_rat  = if (params.basicDebugEn) Some(Vec(1, Output(UInt(PhyRegIdxWidth.W)))) else None
+
+  val sqCanAccept = Input(Bool())
+  val lqCanAccept = Input(Bool())
+
+  val debugTopDown = new Bundle {
+    val fromRob = new RobCoreTopDownIO
+    val fromCore = new CoreDispatchTopDownIO
+  }
+  val debugRolling = new RobDebugRollingIO
+  val debugEnqLsq = Input(new LsqEnqIO)
+}
+
+class NamedIndexes(namedCnt: Seq[(String, Int)]) {
+  require(namedCnt.map(_._1).distinct.size == namedCnt.size, "namedCnt should not have the same name")
+
+  val maxIdx = namedCnt.map(_._2).sum
+  val nameRangeMap: Map[String, (Int, Int)] = namedCnt.indices.map { i =>
+    val begin = namedCnt.slice(0, i).map(_._2).sum
+    val end = begin + namedCnt(i)._2
+    (namedCnt(i)._1, (begin, end))
+  }.toMap
+
+  def apply(name: String): Seq[Int] = {
+    require(nameRangeMap.contains(name))
+    nameRangeMap(name)._1 until nameRangeMap(name)._2
+  }
 }

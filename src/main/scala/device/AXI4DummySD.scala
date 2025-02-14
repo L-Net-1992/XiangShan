@@ -16,12 +16,12 @@
 
 package device
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
-import chisel3.experimental.ExtModule
 import chisel3.util._
+import difftest.common.DifftestSDCard
 import freechips.rocketchip.diplomacy.AddressSet
-import utils._
+import utility._
 
 trait HasSDConst {
   def MemorySize = 4L * 1024 * 1024 * 1024 // 4GB
@@ -35,37 +35,6 @@ trait HasSDConst {
   def MULT = (1 << (C_SIZE_MULT + 2))
 
   def C_SIZE = NrBlock / MULT - 1
-}
-
-class SDHelper extends ExtModule with HasExtModuleInline {
-  val clk = IO(Input(Clock()))
-  val ren = IO(Input(Bool()))
-  val data = IO(Output(UInt(32.W)))
-  val setAddr = IO(Input(Bool()))
-  val addr = IO(Input(UInt(32.W)))
-
-  setInline("SDHelper.v",
-    s"""
-       |import "DPI-C" function void sd_setaddr(input int addr);
-       |import "DPI-C" function void sd_read(output int data);
-       |
-       |module SDHelper (
-       |  input clk,
-       |  input setAddr,
-       |  input [31:0] addr,
-       |  input ren,
-       |  output reg [31:0] data
-       |);
-       |
-       |  always @(negedge clk) begin
-       |    if (ren) sd_read(data);
-       |  end
-       |  always@(posedge clk) begin
-       |    if (setAddr) sd_setaddr(addr);
-       |  end
-       |
-       |endmodule
-     """.stripMargin)
 }
 
 class AXI4DummySD
@@ -120,9 +89,8 @@ class AXI4DummySD
       wdata
     }
 
-    val sdHelper = Module(new SDHelper)
-    sdHelper.clk := clock
-    sdHelper.ren := (getOffset(raddr) === 0x40.U && in.ar.fire())
+    val sdHelper = DifftestSDCard()
+    sdHelper.ren := (getOffset(raddr) === 0x40.U && in.ar.fire)
     sdHelper.setAddr := setAddr
     sdHelper.addr := regs(sdarg)
 
@@ -148,7 +116,7 @@ class AXI4DummySD
     val strb = Mux(waddr(2), in.w.bits.strb(7, 4), in.w.bits.strb(3, 0))
     val rdata = Wire(UInt(32.W))
     RegMap.generate(mapping, getOffset(raddr), rdata,
-      getOffset(waddr), in.w.fire(), in.w.bits.data(31, 0), MaskExpand(strb))
+      getOffset(waddr), in.w.fire, in.w.bits.data(31, 0), MaskExpand(strb))
 
     in.r.bits.data := Fill(2, rdata)
   }

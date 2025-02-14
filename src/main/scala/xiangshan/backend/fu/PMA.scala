@@ -19,8 +19,10 @@ package xiangshan.backend.fu
 import chisel3._
 import chisel3.util._
 import freechips.rocketchip.regmapper.{RegField, RegFieldDesc, RegReadFn, RegWriteFn}
-import utils.{ParallelPriorityMux, ZeroExt, ValidHold}
+import utility.{ParallelPriorityMux, ValidHold, ZeroExt}
 import xiangshan.cache.mmu.TlbCmd
+
+import scala.collection.mutable.ListBuffer
 
 /* Memory Mapped PMA */
 case class MMPMAConfig
@@ -30,6 +32,23 @@ case class MMPMAConfig
   lgMaxSize: Int,
   sameCycle: Boolean,
   num: Int
+)
+
+case class MemoryRange(lower: BigInt, upper: BigInt) {
+  def cover(addr: BigInt): Boolean = addr >= lower && addr < upper
+  def cover(addr: UInt): Bool = addr >= lower.U && addr < upper.U
+}
+
+case class PMAConfigEntry(
+  base_addr: BigInt,
+  range: BigInt = 0L, // only use for napot mode
+  l: Boolean = false,
+  c: Boolean = false,
+  atomic: Boolean = false,
+  a: Int = 0,
+  x: Boolean = false,
+  w: Boolean = false,
+  r: Boolean = false
 )
 
 trait PMAConst extends PMPConst
@@ -68,7 +87,7 @@ trait MMPMAMethod extends PMAConst with PMAMethod with PMPReadWriteMethodBare {
         if (notempty) { (r_ready, o_valid, pmaCfgMerged(pmaCfgIndex(i))) }
         else { (r_ready, o_valid, 0.U) }
       }, w = RegWriteFn((valid, data) => {
-        if (notempty) { when (valid) { pmaCfgMerged(pmaCfgIndex(i)) := write_cfg_vec(mask, addr, i)(data) } }
+        if (notempty) { when (valid) { pmaCfgMerged(pmaCfgIndex(i)) := write_cfg_vec(mask, addr, i, pmaCfgMerged(pmaCfgIndex(i)))(data) } }
         true.B
       }), desc = RegFieldDesc(s"MMPMA_config_${i}", s"pma config register #${i}"))
     }}
@@ -108,104 +127,63 @@ trait PMAMethod extends PMAConst {
       MemMap("h00_3801_0000", "h00_3801_FFFF",   "h0", "BEU",         "RW"),
       MemMap("h00_3802_0000", "h00_3802_0FFF",   "h0", "DebugModule", "RWX"),
       MemMap("h00_3802_1000", "h00_3802_1FFF",   "h0", "MMPMA",       "RW"),
-      MemMap("h00_3802_2000", "h00_3900_0000",   "h0", "Reserved",    ""),
+      MemMap("h00_3802_2000", "h00_3802_207F",   "h0", "L1DCacheCtrl", "RW"),
+      MemMap("h00_3802_2080", "h00_3802_20FF",   "h0", "L1ICacheCtrl", "RW"),
+      MemMap("h00_3802_2100", "h00_38FF_FFFF",   "h0", "Reserved",    ""),
       MemMap("h00_3900_0000", "h00_3900_1FFF",   "h0", "L3CacheCtrl",  "RW"),
       MemMap("h00_3900_2000", "h00_39FF_FFFF",   "h0", "Reserved",    ""),
-      MemMap("h00_3A00_0000", "h00_3A00_0FFF",   "h0", "PLL0",        "RW),
-      MemMap('h00_3A00_1000", "h00_3BFF_FFFF",   "h0", "Reserved",    ""),
-      MemMap("h00_3C00_0000", "h00_3FFF_FFFF",   "h0", "PLIC",        "RW"),
+      MemMap("h00_3A00_0000", "h00_3FFF_FFFF",   "h0", "",            "RW),
+         Sub("h00_3A00_0000", "h00_3A00_0FFF",   "h0", "PLL0",        "RW),
+         Sub('h00_3A00_1000", "h00_3A7F_FFFF",   "h0", "Reserved",    "RW"),
+         Sub('h00_3A80_0000", "h00_3AFF_FFFF",   "h0", "IMSIC(M)",    "RW"),
+         Sub('h00_3B00_0000", "h00_3BFF_FFFF",   "h0", "IMSIC(S/VS)", "RW"),
+         Sub("h00_3C00_0000", "h00_3FFF_FFFF",   "h0", "PLIC",        "RW"),
       MemMap("h00_4000_0000", "h00_7FFF_FFFF",   "h0", "PCIe",        "RW"),
-      MemMap("h00_8000_0000", "h0F_FFFF_FFFF",   "h0", "DDR",         "RWXIDSA"),
+      MemMap("h00_8000_0000", "h7FF_FFFF_FFFF",  "h0", "DDR",         "RWXIDSA"),
     )
    */
 
   def pma_init() : (Vec[UInt], Vec[UInt], Vec[UInt]) = {
-    // the init value is zero
-    // from 0 to num(default 16) - 1, lower priority
-    // according to simple map, 9 entries is needed, pick 6-14, leave 0-5 & 15 unusedcfgMerged.map(_ := 0.U)
+    def genAddr(init_addr: BigInt) = {
+      init_addr.U((PMPAddrBits - PMPOffBits).W)
+    }
+    def genMask(init_addr: BigInt, a: BigInt) = {
+      val match_mask_addr = (init_addr << 1) | (a & 0x1) | (((1 << PlatformGrain) - 1) >> PMPOffBits)
+      val mask = ((match_mask_addr & ~(match_mask_addr + 1)) << PMPOffBits) | ((1 << PMPOffBits) - 1)
+      mask.U(PMPAddrBits.W)
+    }
 
     val num = NumPMA
     require(num >= 16)
-    val cfg = WireInit(0.U.asTypeOf(Vec(num, new PMPConfig())))
 
-    val addr = Wire(Vec(num, UInt((PMPAddrBits-PMPOffBits).W)))
-    val mask = Wire(Vec(num, UInt(PMPAddrBits.W)))
-    addr := DontCare
-    mask := DontCare
+    val cfg_list = ListBuffer[UInt]()
+    val addr_list = ListBuffer[UInt]()
+    val mask_list = ListBuffer[UInt]()
 
-    var idx = num-1
+    def addPMA(conf: PMAConfigEntry) = {
+      val addr = if (conf.a < 2) { shift_addr(conf.base_addr) }
+        else { get_napot(conf.base_addr, conf.range) }
+      cfg_list.append(PMPConfigUInt(conf.l, conf.c, conf.atomic, conf.a, conf.x, conf.w, conf.r))
+      addr_list.append(genAddr(addr))
+      mask_list.append(genMask(addr, conf.a))
+    }
 
-    // TODO: turn to napot to save entries
-    // use tor instead of napot, for napot may be confusing and hard to understand
-    // NOTE: all the addr space are default set to DDR, RWXCA
-    idx = idx - 1
-    addr(idx) := shift_addr(0xFFFFFFFFFL) // all the addr are default ddr, whicn means rwxca
-    cfg(idx).a := 3.U; cfg(idx).r := true.B; cfg(idx).w := true.B; cfg(idx).x := true.B; cfg(idx).c := true.B; cfg(idx).atomic := true.B
-    mask(idx) := match_mask(addr(idx), cfg(idx))
-    idx = idx - 1
+    PMAConfigs.foreach(addPMA)
+    while (cfg_list.length < 16) {
+      addPMA(PMAConfigEntry(0))
+    }
 
-    // NOTE: (0x0_0000_0000L, 0x0_8000_0000L) are default set to MMIO, only RW
-    addr(idx) := get_napot(0x00000000L, 0x80000000L)
-    cfg(idx).a := 3.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    mask(idx) := match_mask(addr(idx), cfg(idx))
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x3C000000)
-    cfg(idx).a := 1.U
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x3A001000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x3A000000)
-    cfg(idx).a := 1.U
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x39002000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x39000000)
-    cfg(idx).a := 1.U
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x38022000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x38021000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B; cfg(idx).x := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr(0x38020000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr( 0x30050000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr( 0x30010000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr( 0x20000000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B; cfg(idx).x := true.B
-    idx = idx - 1
-
-    addr(idx) := shift_addr( 0x10000000)
-    cfg(idx).a := 1.U; cfg(idx).r := true.B; cfg(idx).w := true.B
-    idx = idx - 1
-    
-    require(idx >= 0)
-    addr(idx) := shift_addr(0)
-
-    val cfgInitMerge = cfg.asTypeOf(Vec(num/8, UInt(PMXLEN.W)))
-    (cfgInitMerge, addr, mask)
+    val cfgInitMerge = Seq.tabulate(num / 8)(i => {
+      cfg_list.reverse.drop(8 * i).take(8).foldRight(BigInt(0L)) { case (a, result) =>
+        (result << a.getWidth) | a.litValue
+      }.U(PMXLEN.W)
+    })
+    val addr = addr_list.reverse
+    val mask = mask_list.reverse
+    (VecInit(cfgInitMerge), VecInit(addr.toSeq), VecInit(mask.toSeq))
   }
 
-  def get_napot(base: BigInt, range: BigInt) = {
+  def get_napot(base: BigInt, range: BigInt): BigInt = {
     val PlatformGrainBytes = (1 << PlatformGrain)
     if ((base % PlatformGrainBytes) != 0) {
       println("base:%x", base)
@@ -216,26 +194,31 @@ trait PMAMethod extends PMAConst {
     require((base % PlatformGrainBytes) == 0)
     require((range % PlatformGrainBytes) == 0)
 
-    ((base + (range/2 - 1)) >> PMPOffBits).U
+    ((base + (range/2 - 1)) >> PMPOffBits)
   }
 
   def match_mask(paddr: UInt, cfg: PMPConfig) = {
-    val match_mask_addr: UInt = Cat(paddr, cfg.a(0)).asUInt() | (((1 << PlatformGrain) - 1) >> PMPOffBits).U((paddr.getWidth + 1).W)
+    val match_mask_addr: UInt = Cat(paddr, cfg.a(0)).asUInt | (((1 << PlatformGrain) - 1) >> PMPOffBits).U((paddr.getWidth + 1).W)
     Cat(match_mask_addr & ~(match_mask_addr + 1.U), ((1 << PMPOffBits) - 1).U(PMPOffBits.W))
   }
 
   def shift_addr(addr: BigInt) = {
-    (addr >> 2).U
+    addr >> 2
   }
 }
 
 trait PMACheckMethod extends PMPConst {
   def pma_check(cmd: UInt, cfg: PMPConfig) = {
     val resp = Wire(new PMPRespBundle)
-    resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAtom(cmd) && !cfg.r
-    resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAtom(cmd) && cfg.atomic) && !cfg.w
+    resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r
+    resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd) && cfg.atomic) && !cfg.w
     resp.instr := TlbCmd.isExec(cmd) && !cfg.x
-    resp.mmio := !cfg.c
+    //TODO We require that a `PMA` can generate an mmio response only if the address has the appropriate `PMA` permissions.
+    resp.mmio := !cfg.c &&
+                 (TlbCmd.isRead(cmd) && cfg.r ||
+                 (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd) && cfg.atomic) && cfg.w ||
+                 TlbCmd.isExec(cmd) && cfg.x)
+    resp.atomic := cfg.atomic
     resp
   }
 

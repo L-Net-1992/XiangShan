@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -17,14 +18,19 @@
 package xiangshan.mem
 
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
-import xiangshan._
+import utility._
 import utils._
+import xiangshan._
+import xiangshan.backend.Bundles.{DynInst, MemExuInput}
 import xiangshan.backend.rob.RobPtr
 import xiangshan.cache._
 import xiangshan.backend.fu.FenceToSbuffer
+import xiangshan.cache.wpu.ReplayCarry
+import xiangshan.mem.prefetch.PrefetchReqBundle
+import math._
 
 object genWmask {
   def apply(addr: UInt, sizeEncode: UInt): UInt = {
@@ -33,111 +39,61 @@ object genWmask {
       "b01".U -> 0x3.U, //0011
       "b10".U -> 0xf.U, //1111
       "b11".U -> 0xff.U //11111111
-    )) << addr(2, 0)).asUInt()
+    )) << addr(2, 0)).asUInt
   }
 }
 
-object genWdata {
-  def apply(data: UInt, sizeEncode: UInt): UInt = {
+object genVWmask {
+  def apply(addr: UInt, sizeEncode: UInt): UInt = {
+    (LookupTree(sizeEncode, List(
+      "b00".U -> 0x1.U, //0001 << addr(2:0)
+      "b01".U -> 0x3.U, //0011
+      "b10".U -> 0xf.U, //1111
+      "b11".U -> 0xff.U //11111111
+    )) << addr(3, 0)).asUInt
+  }
+}
+
+object genBasemask {
+  /**
+   *
+   * @param addr
+   * @param sizeEncode
+   * @return Return 16-byte aligned mask.
+   *
+   *         Example:
+   *         Address: 0x80000003 Encoding size: ‘b11
+   *         Return: 0xff
+   */
+  def apply(addr: UInt, sizeEncode: UInt): UInt = {
     LookupTree(sizeEncode, List(
-      "b00".U -> Fill(8, data(7, 0)),
-      "b01".U -> Fill(4, data(15, 0)),
-      "b10".U -> Fill(2, data(31, 0)),
-      "b11".U -> data
+      "b00".U -> 0x1.U,
+      "b01".U -> 0x3.U,
+      "b10".U -> 0xf.U,
+      "b11".U -> 0xff.U
     ))
   }
 }
 
-class LsPipelineBundle(implicit p: Parameters) extends XSBundleWithMicroOp {
-  val vaddr = UInt(VAddrBits.W)
-  val paddr = UInt(PAddrBits.W)
-  // val func = UInt(6.W)
-  val mask = UInt(8.W)
-  val data = UInt((XLEN+1).W)
-  val wlineflag = Bool() // store write the whole cache line
-
-  val miss = Bool()
-  val tlbMiss = Bool()
-  val ptwBack = Bool()
-  val mmio = Bool()
-  val rsIdx = UInt(log2Up(IssQueSize).W)
-
-  val forwardMask = Vec(8, Bool())
-  val forwardData = Vec(8, UInt(8.W))
-
-  //softprefetch
-  val isSoftPrefetch = Bool() 
-
-  // For debug usage
-  val isFirstIssue = Bool()
+object shiftDataToLow {
+  def apply(addr: UInt, data : UInt): UInt = {
+    Mux(addr(3), (data >> 64).asUInt, data)
+  }
 }
-
-class LoadForwardQueryIO(implicit p: Parameters) extends XSBundleWithMicroOp {
-  val vaddr = Output(UInt(VAddrBits.W))
-  val paddr = Output(UInt(PAddrBits.W))
-  val mask = Output(UInt(8.W))
-  override val uop = Output(new MicroOp) // for replay
-  val pc = Output(UInt(VAddrBits.W)) //for debug
-  val valid = Output(Bool())
-
-  val forwardMaskFast = Input(Vec(8, Bool())) // resp to load_s1
-  val forwardMask = Input(Vec(8, Bool())) // resp to load_s2
-  val forwardData = Input(Vec(8, UInt(8.W))) // resp to load_s2
-
-  // val lqIdx = Output(UInt(LoadQueueIdxWidth.W))
-  val sqIdx = Output(new SqPtr)
-
-  // dataInvalid suggests store to load forward found forward should happen,
-  // but data is not available for now. If dataInvalid, load inst should
-  // be replayed from RS. Feedback type should be RSFeedbackType.dataInvalid
-  val dataInvalid = Input(Bool()) // Addr match, but data is not valid for now
-
-  // matchInvalid suggests in store to load forward logic, paddr cam result does
-  // to equal to vaddr cam result. If matchInvalid, a microarchitectural exception
-  // should be raised to flush SQ and committed sbuffer.
-  val matchInvalid = Input(Bool()) // resp to load_s2
+object shiftMaskToLow {
+  def apply(addr: UInt, mask: UInt): UInt = {
+    Mux(addr(3), (mask >> 8).asUInt, mask)
+  }
 }
-
-// LoadForwardQueryIO used in load pipeline
-//
-// Difference between PipeLoadForwardQueryIO and LoadForwardQueryIO:
-// PipeIO use predecoded sqIdxMask for better forward timing
-class PipeLoadForwardQueryIO(implicit p: Parameters) extends LoadForwardQueryIO {
-  // val sqIdx = Output(new SqPtr) // for debug, should not be used in pipeline for timing reasons
-  // sqIdxMask is calcuated in earlier stage for better timing
-  val sqIdxMask = Output(UInt(StoreQueueSize.W))
-
-  // dataInvalid: addr match, but data is not valid for now
-  val dataInvalidFast = Input(Bool()) // resp to load_s1
-  // val dataInvalid = Input(Bool()) // resp to load_s2
-  val dataInvalidSqIdx = Input(UInt(log2Up(StoreQueueSize).W)) // resp to load_s2, sqIdx value
+object shiftDataToHigh {
+  def apply(addr: UInt, data : UInt): UInt = {
+    Mux(addr(3), (data << 64).asUInt, data)
+  }
 }
-
-// Query load queue for ld-ld violation
-// 
-// Req should be send in load_s1
-// Resp will be generated 1 cycle later
-//
-// Note that query req may be !ready, as dcache is releasing a block
-// If it happens, a replay from rs is needed.
-
-class LoadViolationQueryReq(implicit p: Parameters) extends XSBundleWithMicroOp { // provide lqIdx
-  val paddr = UInt(PAddrBits.W)
-}
-
-class LoadViolationQueryResp(implicit p: Parameters) extends XSBundle {
-  val have_violation = Bool()
-}
-
-class LoadViolationQueryIO(implicit p: Parameters) extends XSBundle {
-  val req = Decoupled(new LoadViolationQueryReq)
-  val resp = Flipped(Valid(new LoadViolationQueryResp))
-}
-
-// Bundle for load / store wait waking up
-class MemWaitUpdateReq(implicit p: Parameters) extends XSBundle {
-  val staIssue = Vec(exuParameters.StuCnt, ValidIO(new ExuInput))
-  val stdIssue = Vec(exuParameters.StuCnt, ValidIO(new ExuInput))
+object shiftMaskToHigh {
+  def apply(addr: UInt, mask: UInt): UInt = {
+    Mux(addr(3), (mask << 8).asUInt, mask)
+  }
 }
 
 object AddPipelineReg {
@@ -150,19 +106,19 @@ object AddPipelineReg {
 
     val valid = RegInit(false.B)
     valid.suggestName("pipeline_reg_valid")
-    when (io.out.fire()) { valid := false.B }
-    when (io.in.fire()) { valid := true.B }
+    when (io.out.fire) { valid := false.B }
+    when (io.in.fire) { valid := true.B }
     when (io.isFlush) { valid := false.B }
 
     io.in.ready := !valid || io.out.ready
-    io.out.bits := RegEnable(io.in.bits, io.in.fire())
+    io.out.bits := RegEnable(io.in.bits, io.in.fire)
     io.out.valid := valid //&& !isFlush
   }
 
   def apply[T <: Data]
   (left: DecoupledIO[T], right: DecoupledIO[T], isFlush: Bool,
    moduleName: Option[String] = None
-  ){
+  ): Unit = {
     val pipelineReg = Module(new PipelineRegModule[T](left.bits.cloneType))
     if(moduleName.nonEmpty) pipelineReg.suggestName(moduleName.get)
     pipelineReg.io.in <> left

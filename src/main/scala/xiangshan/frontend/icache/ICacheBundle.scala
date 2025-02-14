@@ -1,5 +1,6 @@
 /***************************************************************************************
-* Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
+* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
 * Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * XiangShan is licensed under Mulan PSL v2.
@@ -16,91 +17,74 @@
 
 package xiangshan.frontend.icache
 
-import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.tilelink.{ClientMetadata, TLPermissions}
-import xiangshan._
-import utils._
+import org.chipsalliance.cde.config.Parameters
 
-
-class ICacheReadBundle(implicit p: Parameters) extends ICacheBundle
-{
-  val isDoubleLine  = Bool()
-  val vSetIdx       = Vec(2,UInt(log2Ceil(nSets).W))
+class ICacheReadBundle(implicit p: Parameters) extends ICacheBundle {
+  val vSetIdx:      Vec[UInt]      = Vec(2, UInt(idxBits.W))
+  val waymask:      Vec[Vec[Bool]] = Vec(2, Vec(nWays, Bool()))
+  val blkOffset:    UInt           = UInt(log2Ceil(blockBytes).W)
+  val isDoubleLine: Bool           = Bool()
 }
 
-class ICacheMetaRespBundle(implicit p: Parameters) extends ICacheBundle
-{
-  val metaData   = Vec(2, Vec(nWays, new ICacheMetadata))
-  val errors = Vec(2, Vec(nWays ,Bool() ))
+class ICacheMetaWriteBundle(implicit p: Parameters) extends ICacheBundle {
+  val virIdx:  UInt = UInt(idxBits.W)
+  val phyTag:  UInt = UInt(tagBits.W)
+  val waymask: UInt = UInt(nWays.W)
+  val bankIdx: Bool = Bool()
+  val poison:  Bool = Bool()
 
-  def tags = VecInit(metaData.map(port => VecInit(port.map( way=> way.tag ))))
-  def cohs = VecInit(metaData.map(port => VecInit(port.map( way=> way.coh ))))
-}
-
-class ICacheMetaWriteBundle(implicit p: Parameters) extends ICacheBundle
-{
-  val virIdx  = UInt(idxBits.W)
-  val phyTag  = UInt(tagBits.W)
-  val coh     = new ClientMetadata
-  val waymask = UInt(nWays.W)
-  val bankIdx = Bool()
-
-  def generate(tag:UInt, coh: ClientMetadata, idx:UInt, waymask:UInt, bankIdx: Bool){
+  def generate(tag: UInt, idx: UInt, waymask: UInt, bankIdx: Bool, poison: Bool): Unit = {
     this.virIdx  := idx
     this.phyTag  := tag
-    this.coh     := coh
     this.waymask := waymask
-    this.bankIdx   := bankIdx
+    this.bankIdx := bankIdx
+    this.poison  := poison
   }
-
 }
 
-class ICacheDataWriteBundle(implicit p: Parameters) extends ICacheBundle
-{
-  val virIdx  = UInt(idxBits.W)
-  val data    = UInt(blockBits.W)
-  val waymask = UInt(nWays.W)
-  val bankIdx = Bool()
-  val paddr   = UInt(PAddrBits.W)
+class ICacheMetaFlushBundle(implicit p: Parameters) extends ICacheBundle {
+  val virIdx:  UInt = UInt(idxBits.W)
+  val waymask: UInt = UInt(nWays.W)
+}
 
-  def generate(data:UInt, idx:UInt, waymask:UInt, bankIdx: Bool, paddr: UInt){
+class ICacheDataWriteBundle(implicit p: Parameters) extends ICacheBundle {
+  val virIdx:  UInt = UInt(idxBits.W)
+  val data:    UInt = UInt(blockBits.W)
+  val waymask: UInt = UInt(nWays.W)
+  val bankIdx: Bool = Bool()
+  val poison:  Bool = Bool()
+
+  def generate(data: UInt, idx: UInt, waymask: UInt, bankIdx: Bool, poison: Bool): Unit = {
     this.virIdx  := idx
     this.data    := data
     this.waymask := waymask
     this.bankIdx := bankIdx
-    this.paddr   := paddr
+    this.poison  := poison
   }
-
 }
 
-class ICacheDataRespBundle(implicit p: Parameters) extends ICacheBundle
-{
-  val datas = Vec(2, Vec(nWays,  UInt(blockBits.W)))
-  val codes = Vec(2, Vec(nWays , UInt(dataCodeEntryBits.W)))
+class ICacheMetaRespBundle(implicit p: Parameters) extends ICacheBundle {
+  val metas:      Vec[Vec[ICacheMetadata]] = Vec(PortNumber, Vec(nWays, new ICacheMetadata))
+  val codes:      Vec[Vec[UInt]]           = Vec(PortNumber, Vec(nWays, UInt(ICacheMetaCodeBits.W)))
+  val entryValid: Vec[Vec[Bool]]           = Vec(PortNumber, Vec(nWays, Bool()))
+
+  // for compatibility
+  def tags: Vec[Vec[UInt]] = VecInit(metas.map(port => VecInit(port.map(way => way.tag))))
 }
 
-class ICacheMetaReadBundle(implicit p: Parameters) extends ICacheBundle
-{
-    val req     = Flipped(DecoupledIO(new ICacheReadBundle))
-    val resp = Output(new ICacheMetaRespBundle)
+class ICacheDataRespBundle(implicit p: Parameters) extends ICacheBundle {
+  val datas: Vec[UInt] = Vec(ICacheDataBanks, UInt(ICacheDataBits.W))
+  val codes: Vec[UInt] = Vec(ICacheDataBanks, UInt(ICacheDataCodeBits.W))
 }
 
-class ICacheCommonReadBundle(isMeta: Boolean)(implicit p: Parameters) extends ICacheBundle
-{
-    val req     = Flipped(DecoupledIO(new ICacheReadBundle))
-    val resp    = if(isMeta) Output(new ICacheMetaRespBundle) else Output(new ICacheDataRespBundle)
+class ReplacerTouch(implicit p: Parameters) extends ICacheBundle {
+  val vSetIdx: UInt = UInt(idxBits.W)
+  val way:     UInt = UInt(wayBits.W)
 }
 
-class ICacheProbeReq(implicit p: Parameters) extends ICacheBundle {
-  val miss = Bool()
-  val probe_param = UInt(TLPermissions.bdWidth.W)
-  val addr = UInt(PAddrBits.W)
-  val vaddr = UInt(VAddrBits.W)
-}
-
-class ICacheVictimInfor(implicit p: Parameters) extends ICacheBundle {
-  val valid = Bool()
-  val vidx  = UInt(idxBits.W)
+class ReplacerVictim(implicit p: Parameters) extends ICacheBundle {
+  val vSetIdx: Valid[UInt] = ValidIO(UInt(idxBits.W))
+  val way:     UInt        = Input(UInt(wayBits.W))
 }

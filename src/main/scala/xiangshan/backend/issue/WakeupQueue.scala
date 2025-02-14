@@ -16,11 +16,12 @@
 
 package xiangshan.backend.issue
 
-import chipsalliance.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import xiangshan._
 import utils._
+import utility._
 
 class WakeupQueue(number: Int)(implicit p: Parameters) extends XSModule {
   val io = IO(new Bundle {
@@ -50,7 +51,7 @@ class WakeupQueue(number: Int)(implicit p: Parameters) extends XSModule {
     io.out.bits := queue(number-1).bits
     for (i <- 0 until number) {
       XSDebug(queue(i).valid, p"BPQue(${i.U}): pc:${Hexadecimal(queue(i).bits.cf.pc)} robIdx:${queue(i).bits.robIdx}" +
-        p" pdest:${queue(i).bits.pdest} rfWen:${queue(i).bits.ctrl.rfWen} fpWen${queue(i).bits.ctrl.fpWen}\n")
+        p" pdest:${queue(i).bits.pdest} rfWen:${queue(i).bits.ctrl.rfWen} fpWen:${queue(i).bits.ctrl.fpWen} vecWen:${queue(i).bits.ctrl.vecWen}\n")
     }
   }
 }
